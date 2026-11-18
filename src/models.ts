@@ -50,6 +50,11 @@ export const FALLBACK_MODELS: readonly Model<typeof API_ID>[] = [
 		medium: "gemini-3.8-flash-medium",
 		high: "gemini-3.8-flash-high",
 	}),
+	reasoningModel("gemini-4-carbon", "Gemini 4 Carbon", {
+		low: "gemini-4-carbon-low",
+		medium: "gemini-4-carbon-medium",
+		high: "gemini-4-carbon-high",
+	}),
 	reasoningModel("gemini-4-hydrogen", "Gemini 4 Hydrogen", {
 		low: "gemini-4-hydrogen-low",
 		medium: "gemini-4-hydrogen-medium",
@@ -60,6 +65,16 @@ export const FALLBACK_MODELS: readonly Model<typeof API_ID>[] = [
 		low: "gemini-4-argon-low",
 		medium: "gemini-4-argon-medium",
 		high: "gemini-4-argon-high",
+	}),
+	reasoningModel("claude-opus-5-5", "Claude Opus 5.5", {
+		low: "claude-opus-5-5-low",
+		medium: "claude-opus-5-5-medium",
+		high: "claude-opus-5-5-high",
+	}),
+	reasoningModel("claude-sonnet-5-5", "Claude Sonnet 5.5", {
+		low: "claude-sonnet-5-5-low",
+		medium: "claude-sonnet-5-5-medium",
+		high: "claude-sonnet-5-5-high",
 	}),
 	reasoningModel("gemini-3.7-flash", "Gemini 3.7 Flash", {
 		low: "gemini-3.7-flash-low",
@@ -90,7 +105,7 @@ export function projectModels(models: readonly AcpModelInfo[]): Model<typeof API
 	for (const candidate of safe) {
 		const id = candidate.modelId.trim();
 		const parsed = effortFromName(candidate.name) ?? effortFromId(id);
-		if (!id.startsWith("gemini-") || !parsed) continue;
+		if (!parsed) continue;
 		const key = parsed.baseName.toLowerCase();
 		const group = groups.get(key) ?? { name: parsed.baseName, variants: {}, members: [] };
 		group.variants[parsed.effort] = id;
@@ -121,7 +136,7 @@ export function projectModels(models: readonly AcpModelInfo[]): Model<typeof API
 		// Argon Medium during a rollout). Preserve its exact public/ACP ID and
 		// expose only that tier, rather than claiming thinking is unsupported or
 		// guessing additional variants which may not exist for this account.
-		projected.push(id.startsWith("gemini-") && parsed
+		projected.push(parsed
 			? reasoningModel(id, candidate.name.trim() || id, { [parsed.effort]: id })
 			: fixedModel(id, candidate.name.trim() || id));
 	}

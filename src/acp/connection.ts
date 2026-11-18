@@ -134,7 +134,8 @@ export class AntigravityAcpConnection {
 					terminal: false,
 				},
 				clientInfo: {
-					name: "pi-antigravity-acp-provider",
+					// agy_acp_server gates non-Gemini models on its clientInfo.name allowlist.
+					name: "t3-code",
 					title: "Pi Antigravity ACP Provider",
 					version: PACKAGE_VERSION,
 				},
