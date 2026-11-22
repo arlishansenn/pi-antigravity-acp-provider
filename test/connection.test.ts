@@ -265,6 +265,7 @@ describe("AntigravityAcpConnection", () => {
 		try {
 			await connection.initialize();
 			const session = await connection.newSession(process.cwd());
+			connection.process.child.stderr.push(`${"startup-noise ".repeat(350)}\n`);
 			connection.process.child.stderr.push(
 				"WARNING: System step error (HTTP 502): The model is currently unreachable. api_key=AIza1234567890abcdefghijkl\n",
 			);
@@ -273,9 +274,8 @@ describe("AntigravityAcpConnection", () => {
 				prompt: [{ type: "text", text: "hang" }],
 			}).catch((cause: unknown) => cause);
 			expect(error).toBeInstanceOf(Error);
-			expect((error as Error).message).toContain(
-				"Antigravity ACP session/prompt timed out: no progress for 40ms: WARNING: System step error (HTTP 502): The model is currently unreachable.",
-			);
+			expect((error as Error).message).toContain("Antigravity ACP session/prompt timed out: no progress for 40ms:");
+			expect((error as Error).message).toContain("WARNING: System step error (HTTP 502): The model is currently unreachable.");
 			expect((error as Error).message).toContain("<redacted>");
 			expect((error as Error).message).not.toContain("AIza1234567890abcdefghijkl");
 		} finally {
@@ -366,6 +366,67 @@ describe("AntigravityAcpConnection", () => {
 				await connection.process.exited;
 				expect(Date.now() - started).toBeLessThan(3_500);
 				expect(connection.process.alive).toBe(false);
+			} finally { await connection.close(); }
+		});
+	});
+
+	describe("when agy silently retries transient 502/503/504/408 errors", () => {
+		const unavailableAgent = (stepMs = 20, idleMs = 2_500) => new AntigravityAcpConnection({
+			cwd: process.cwd(),
+			command: process.execPath,
+			args: [fakeAgent, "upstream-unavailable"],
+			promptIdleTimeoutMs: idleMs,
+			env: { ...process.env, FAKE_RETRY_STEP_MS: String(stepMs) },
+		});
+		const prompt = (connection: AntigravityAcpConnection, sessionId: string, text: string, signal?: AbortSignal) =>
+			connection.prompt({ sessionId, prompt: [{ type: "text", text }] }, signal);
+
+		it("fails the prompt fast with a retryable model error and keeps the latest redacted stderrTail", async () => {
+			const connection = unavailableAgent();
+			try {
+				const session = await connection.newSession(process.cwd());
+				const started = Date.now();
+				const error = await prompt(connection, session.sessionId, "Reply with exactly: PONG").catch((cause: unknown) => cause);
+				expect(Date.now() - started).toBeLessThan(1_500);
+				expect(error).toBeInstanceOf(AntigravityAcpError);
+				expect((error as AntigravityAcpError).code).toBe("model");
+				expect((error as Error).message).toBe(
+					"Antigravity model service temporarily unavailable (HTTP 502): agy retried 3 times, next retry in 10.71s, without a reply.",
+				);
+				await connection.process.exited;
+				expect(connection.process.alive).toBe(false);
+				expect(connection.process.stderrTail).toContain("Error 502, Message: Bad Gateway");
+				expect(connection.process.stderrTail).toContain("access_token=<redacted>");
+				expect(connection.process.stderrTail).not.toContain("ya29.fake-secret-access-token");
+			} finally { await connection.close(); }
+		});
+
+		it.each(["retries 1", "retries 2"])("completes a turn that recovers from transient 502s: %s", async (text) => {
+			const updates: string[] = [];
+			const connection = unavailableAgent();
+			connection.setHandlers({ onUpdate: (notification) => { updates.push(notification.update.sessionUpdate); } });
+			try {
+				const session = await connection.newSession(process.cwd());
+				expect((await prompt(connection, session.sessionId, text)).stopReason).toBe("end_turn");
+				expect(updates).toEqual(["agent_message_chunk"]);
+				expect(connection.process.alive).toBe(true);
+			} finally { await connection.close(); }
+		});
+
+		it("resets the transient retry count on streaming updates and permission requests", async () => {
+			const updates: string[] = [];
+			let permissions = 0;
+			const connection = unavailableAgent();
+			connection.setHandlers({
+				onUpdate: (notification) => { updates.push(notification.update.sessionUpdate); },
+				onPermission: async () => { permissions++; return { outcome: { outcome: "selected", optionId: "allow-once" } }; },
+			});
+			try {
+				const session = await connection.newSession(process.cwd());
+				expect((await prompt(connection, session.sessionId, "retries 2 progress")).stopReason).toBe("end_turn");
+				expect((await prompt(connection, session.sessionId, "retries 2 permission")).stopReason).toBe("end_turn");
+				expect(permissions).toBe(1);
+				expect(updates).toEqual(["agent_thought_chunk", "agent_message_chunk", "agent_message_chunk"]);
 			} finally { await connection.close(); }
 		});
 	});

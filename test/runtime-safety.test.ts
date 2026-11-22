@@ -651,6 +651,28 @@ describe("quota exhaustion", () => {
 		expect(store.get("exhausted")?.messageCount ?? 0).toBe(0);
 	});
 
+	it.each([408, 502, 503, 504])("fails a turn stuck on HTTP %i retries as a Pi-retryable error, evicts the wedged binding, and recovers on retry", async (statusCode) => {
+		const fixture = setup();
+		const store = new AcpSessionStore(path.join(fixture.root, "sessions.json"));
+		const { runtime } = setup("upstream-unavailable", "yolo", store);
+		const sessionKey = `unavailable-${statusCode}`;
+		const first = await Promise.race([
+			turn(runtime, [user(`status ${statusCode} recover-on-respawn`)], sessionKey),
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("prompt stalled instead of failing fast")), 2_000)),
+		]);
+		expect(first.stopReason).toBe("error");
+		expect(first.errorMessage).toBe(
+			`Antigravity model service temporarily unavailable (HTTP ${statusCode}): agy retried 3 times, next retry in 10.71s, without a reply.`,
+		);
+		expect(isRetryableAssistantError(first)).toBe(true);
+		expect((await runtime.snapshot()).bindings).toBe(0);
+		expect(store.get(sessionKey)?.messageCount ?? 0).toBe(0);
+
+		const retried = await turn(runtime, [user(`status ${statusCode} recover-on-respawn`)], sessionKey);
+		expect(retried.stopReason).toBe("stop");
+		expect(retried.content).toEqual([expect.objectContaining({ type: "text", text: "PONG" })]);
+	});
+
 	it("leaves a normal reply that quotes the wording untouched", async () => {
 		const { runtime } = quotaSetup();
 		const message = await turn(runtime, [user("quoted")], "quota");
