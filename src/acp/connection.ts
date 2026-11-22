@@ -19,7 +19,7 @@ import { boundedNdjsonStream } from "./bounded-stream.js";
 import { abortError, AntigravityAcpError, redact } from "./errors.js";
 import { AntigravityProcess, type AntigravityProcessOptions } from "./process.js";
 import { PromptWatchdog } from "./prompt-watchdog.js";
-import { ResourceExhaustionTracker } from "./quota.js";
+import { ModelRetryTracker } from "./quota.js";
 import {
 	decodeSessionState,
 	findSessionSelector,
@@ -55,7 +55,7 @@ export class AntigravityAcpConnection {
 	private readonly promptIdleTimeoutMs: number;
 	private readonly promptWorkIdleTimeoutMs: number;
 	private readonly watchdogs = new Map<string, PromptWatchdog>();
-	private readonly exhaustion = new Map<string, ResourceExhaustionTracker>();
+	private readonly exhaustion = new Map<string, ModelRetryTracker>();
 	private readonly protocolFailure: Promise<never>;
 	private readonly processFailure: Promise<never>;
 	private readonly sessions = new Map<string, SessionState>();
@@ -421,9 +421,8 @@ export class AntigravityAcpConnection {
 				`Antigravity ACP session/prompt timed out: no ${busy ? "tool/permission " : ""}progress for ${ms}ms${detail}`));
 			void this.close().catch(() => undefined);
 		});
-		// agy retries a 429 without updating or answering; fail the prompt before the idle watchdog.
-		const exhaustion = new ResourceExhaustionTracker((message) => {
-			rejectStall(new AntigravityAcpError("quota", message));
+		const exhaustion = new ModelRetryTracker(({ code, message }) => {
+			rejectStall(new AntigravityAcpError(code, message));
 			void this.close().catch(() => undefined);
 		});
 		this.watchdogs.set(request.sessionId, watchdog);

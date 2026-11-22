@@ -29,7 +29,7 @@ export function errorMessage(cause: unknown): string {
 	return redact(String(cause));
 }
 
-export function redact(text: string): string {
+function scrubSecrets(text: string): string {
 	return text
 		.replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/giu, "$1<redacted>@")
 		.replace(/(?:AIza|sk-|npm_|gh[opurs]_)[A-Za-z0-9_-]{12,}/gu, "<redacted>")
@@ -38,6 +38,13 @@ export function redact(text: string): string {
 		.replace(
 			/((?:["']?(?:access_token|refresh_token|id_token|client_secret|api[-_]?key)["']?)\s*[:=]\s*["']?)[^"'\s,;&}]+/giu,
 			"$1<redacted>",
-		)
-		.slice(0, 4_096);
+		);
+}
+
+export function redact(text: string): string {
+	return scrubSecrets(text).slice(0, 4_096);
+}
+
+export function redactTail(text: string): string {
+	return scrubSecrets(text).slice(-4_096);
 }
