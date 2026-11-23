@@ -2,12 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { normalizeContext, type ModelsPublication, type ModelsStoreEntry } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
 import { AntigravityAcpConnection, type AntigravityConnectionOptions } from "../src/acp/connection.js";
 import { AcpSessionStore } from "../src/acp/session-store.js";
 import { findSessionSelector, sessionModels } from "../src/acp/session-state.js";
-import { projectModels } from "../src/models.js";
+import { projectModels, resolveAcpModelId } from "../src/models.js";
 import { createAntigravityProvider } from "../src/provider.js";
 import { AntigravityRuntime } from "../src/runtime.js";
 
@@ -137,6 +138,73 @@ describe("model selection integration", () => {
 			expect(second.content).toEqual([{ type: "text", text: "gemini-b/high" }]);
 			expect((await runtime.snapshot()).processes[0]?.generation).toBe(generation);
 		} finally { await runtime.close(); }
+	});
+
+	it("routes a stale Pi startup model by exact ID after discovery, never by its copied Flash map", async () => {
+		const runtime = new AntigravityRuntime((options) => connection("new-gemini-4", options));
+		const { provider } = createAntigravityProvider(runtime);
+		const flash = provider.getModels().find((model) => model.id === "gemini-3.8-flash")!;
+		const synthetic = { ...flash, id: "gemini-4-test" };
+		try {
+			expect(resolveAcpModelId(synthetic, "high")).toBe("gemini-4-test");
+			const neon = provider.getModels().find((model) => model.id === "gemini-4-neon")!;
+			expect(resolveAcpModelId(neon, "high")).toBe("gemini-4-neon-high");
+			await provider.refreshModels!({ allowNetwork: true, signal: new AbortController().signal,
+				publish: async ({ update }) => { update?.(); return true; } });
+			expect(provider.getModels().find((model) => model.id === synthetic.id)?.thinkingLevelMap?.high).toBe("gemini-4-test-high");
+			const result = await provider.streamSimple!(synthetic, normalizeContext({ messages: [{ role: "user", content: "probe", timestamp: 1 }] }),
+				{ sessionId: "stale-startup-model", reasoning: "high" }).result();
+			expect(result.content).toEqual([{ type: "text", text: "gemini-4-test/high" }]);
+			expect((await runtime.snapshot()).processes[0]?.modelId).toBe("gemini-4-test-high");
+		} finally { await runtime.close(); }
+	});
+
+	it("persists the discovered catalog and restores it during the next offline startup phase", async () => {
+		const runtime = new AntigravityRuntime((options) => connection("split", options));
+		const { provider } = createAntigravityProvider(runtime);
+		const persisted: ModelsStoreEntry[] = [];
+		const publish = async ({ persist, update }: ModelsPublication) => {
+			if (persist) persisted.push(persist);
+			update?.();
+			return true;
+		};
+		try {
+			await provider.refreshModels!({ allowNetwork: true, signal: new AbortController().signal, publish });
+			expect(persisted).toHaveLength(1);
+			const stored = persisted[0]!;
+			expect(stored.checkedAt).toEqual(expect.any(Number));
+			expect(stored.models.map((model) => model.id)).toEqual(provider.getModels().map((model) => model.id));
+			expect(stored.models.some((model) => model.id === "gemini-b")).toBe(true);
+		} finally { await runtime.close(); }
+
+		// A fresh process starts from the offline fallback, which lacks gemini-b.
+		const offline = new AntigravityRuntime(() => { throw new Error("offline restore must not spawn ACP"); });
+		const restarted = createAntigravityProvider(offline).provider;
+		try {
+			expect(restarted.getModels().some((model) => model.id === "gemini-b")).toBe(false);
+			await restarted.refreshModels!({ allowNetwork: false, signal: new AbortController().signal,
+				stored: JSON.parse(JSON.stringify(persisted[0])), publish });
+			expect(persisted).toHaveLength(1);
+			expect(restarted.getModels().find((model) => model.id === "gemini-b"))
+				.toMatchObject({ reasoning: true, thinkingLevelMap: { low: "gemini-b-low", high: "gemini-b-high" } });
+		} finally { await offline.close(); }
+	});
+
+	it("keeps the offline fallback when nothing usable was persisted", async () => {
+		const offline = new AntigravityRuntime(() => { throw new Error("offline restore must not spawn ACP"); });
+		const { provider } = createAntigravityProvider(offline);
+		const before = provider.getModels().map((model) => model.id);
+		let published = 0;
+		try {
+			const foreign = { models: [{ id: "gpt-x", provider: "openai", api: "openai-completions" }] } as unknown as ModelsStoreEntry;
+			for (const stored of [undefined, { models: [] }, foreign]) {
+				await provider.refreshModels!({ allowNetwork: false, signal: new AbortController().signal, ...(stored ? { stored } : {}),
+					publish: async () => { published += 1; return true; } });
+			}
+			expect(published).toBe(0);
+			expect(provider.getModels().map((model) => model.id)).toEqual(before);
+			expect(before).toContain("gemini-4-carbon");
+		} finally { await offline.close(); }
 	});
 
 	it("discards both warm and saved bindings after a partial selection, then safely retries the original model", async () => {
