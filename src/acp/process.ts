@@ -5,11 +5,10 @@ import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { resolveAntigravityAcpLaunch } from "./antigravity.js";
-import { redact } from "./errors.js";
+import { redactTail } from "./errors.js";
 import { applyAcpProxyEnvironment } from "./proxy.js";
 import { applyCredentialStorageEnvironment, type CredentialStorageOptions } from "./credential-storage.js";
 const STDERR_LIMIT = 16 * 1024;
-const STDERR_LINE_LIMIT = 4 * 1024;
 // Longer than supervisor.mjs's 750 ms agent-tree escalation window.
 const KILL_GRACE_MS = 1_500;
 let nextGeneration = 1;
@@ -166,11 +165,11 @@ export class AntigravityProcess {
 		this.child = child;
 		child.stderr.setEncoding("utf8");
 		child.stderr.on("data", (chunk: string) => {
-			this.stderr = redact((this.stderr + chunk).slice(-STDERR_LIMIT));
+			this.stderr = (this.stderr + chunk).slice(-STDERR_LIMIT);
 			const lines = (this.stderrPartial + chunk).split("\n");
-			this.stderrPartial = lines.pop()!.slice(-STDERR_LINE_LIMIT);
+			this.stderrPartial = lines.pop()!.slice(-STDERR_LIMIT);
 			for (const line of lines) {
-				const safe = redact(line.slice(-STDERR_LINE_LIMIT));
+				const safe = redactTail(line.slice(-STDERR_LIMIT));
 				for (const listener of this.stderrLineListeners) listener(safe);
 			}
 		});
@@ -178,7 +177,7 @@ export class AntigravityProcess {
 			this.finish(resolveExit, null, null, `spawn failed: ${cause.message}`);
 		});
 		child.once("exit", (code, signal) => {
-			this.finish(resolveExit, code, signal, this.stderr);
+			this.finish(resolveExit, code, signal, this.stderrTail);
 		});
 
 		this.input = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
@@ -190,7 +189,7 @@ export class AntigravityProcess {
 	}
 
 	get stderrTail(): string {
-		return this.stderr;
+		return redactTail(this.stderr);
 	}
 
 	/** Complete, redacted and length-bounded stderr lines as they arrive. */
@@ -257,7 +256,7 @@ export class AntigravityProcess {
 	): void {
 		if (this.settled) return;
 		this.settled = true;
-		resolve({ code, signal, stderrTail: redact(stderrTail) });
+		resolve({ code, signal, stderrTail: redactTail(stderrTail) });
 	}
 }
 

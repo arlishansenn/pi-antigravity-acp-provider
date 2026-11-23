@@ -326,18 +326,25 @@ for await (const line of rl) {
 			}).catch(() => undefined);
 			continue;
 		}
-		if (scenario === "resource-exhausted") {
-			// agy retries a model-path 429 with backoff and logs only to stderr: no update, no reply,
-			// and session/cancel is ignored. `retries N` recovers after N retries; with `progress`, the
-			// recovered inference streams an update and the next one retries N times again; with
-			// `permission`, it asks for permission instead, with no update before or after, and then
-			// retries N times again.
-			const retries = Number(/retries (\d+)/u.exec(text)?.[1] ?? Infinity);
+		if (scenario === "resource-exhausted" || scenario === "upstream-unavailable") {
+			const isUnavailable = scenario === "upstream-unavailable";
+			const priorInits = process.env.FAKE_AGENT_LOG_FILE && fs.existsSync(process.env.FAKE_AGENT_LOG_FILE)
+				? fs.readFileSync(process.env.FAKE_AGENT_LOG_FILE, "utf8").split("\n").filter((entry) => entry.includes('"method":"initialize"')).length
+				: 1;
+			const retries = text.includes("recover-on-respawn") && priorInits > 1
+				? 1
+				: Number(/retries (\d+)/u.exec(text)?.[1] ?? Infinity);
+			const statusCode = Number(/status (\d{3})/u.exec(text)?.[1] ?? 502);
 			const asksPermission = text.includes("permission");
 			const log = (line) => process.stderr.write(`I1114 22:07:04.512301 48213 local_connection.py:553] ${line}\n`);
+			if (isUnavailable) {
+				log(`onboard.py:183] loadCodeAssist response: ${"privacy-notice ".repeat(320)}`);
+			}
 			log(`Starting inference with model gemini-4-hydrogen; access_token=ya29.fake-secret-access-token`);
 			if (text.includes("echo")) log(`prompt: ${text}`);
-			const delays = ["4s", "7.26s", "10.74s", "25.89s", "55.55s"];
+			const delays = isUnavailable
+				? ["4s", "5.217655808s", "10.710296171s", "25.89s"]
+				: ["4s", "7.26s", "10.74s", "25.89s", "55.55s"];
 			let attempt = 0;
 			let progressed = !text.includes("progress") && !asksPermission;
 			let awaitingPermission = false;
@@ -364,10 +371,19 @@ for await (const line of rl) {
 					return;
 				}
 				if (attempt < retries) {
-					// Split mid-line: stderr chunks do not follow line boundaries.
-					process.stderr.write("W1114 22:07:04.512301 48213 http_client.go:211] Error 429, Message: Resource has been ex");
-					process.stderr.write("hausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED\n");
-					log(`planner_generator.go:359 Encountered retryable api error. retrying in ${delays[Math.min(attempt, delays.length - 1)]}`);
+					const delay = delays[Math.min(attempt, delays.length - 1)];
+					if (isUnavailable) {
+						if (text.includes("proxy-timeout")) {
+							log("proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out");
+						}
+						process.stderr.write(`I1122 23:33:00.027626 6164262912 local_connection.py:553] harness stderr: received model response error: Error ${statusCode}, Message: Bad Gateway: Failed to con`);
+						process.stderr.write(`nect to backend API, Status: ${statusCode} Bad Gateway, Details: []\n`);
+						log(`harness stderr: ERROR: logging before google.Init: I1122 23:33:00.027643 117 planner_generator.go:359] Encountered retryable api error. retrying in ${delay}. Error (The model is currently unreachable.): Error ${statusCode}, Message: Bad Gateway: Failed to connect to backend API, Status: ${statusCode} Bad Gateway, Details: []`);
+					} else {
+						process.stderr.write("W1114 22:07:04.512301 48213 http_client.go:211] Error 429, Message: Resource has been ex");
+						process.stderr.write("hausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED\n");
+						log(`planner_generator.go:359 Encountered retryable api error. retrying in ${delay}`);
+					}
 					attempt++;
 					return;
 				}
@@ -438,6 +454,9 @@ for await (const line of rl) {
 		}
 		if (!continuing && text.includes("hang")) {
 			hangingPromptId = id;
+			if (text.includes("hang-emit-id")) {
+				process.stderr.write(`hanging-prompt-id:${String(id)}\n`);
+			}
 			continue;
 		}
 		if (!continuing && text.includes("permission")) {

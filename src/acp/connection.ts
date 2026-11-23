@@ -16,10 +16,16 @@ import {
 
 import { PACKAGE_VERSION } from "../constants.js";
 import { boundedNdjsonStream } from "./bounded-stream.js";
-import { abortError, AntigravityAcpError, redact } from "./errors.js";
+import {
+	abortError,
+	AntigravityAcpError,
+	ERROR_STDERR_TAIL_LIMIT,
+	redactBounded,
+	redactTail,
+} from "./errors.js";
 import { AntigravityProcess, type AntigravityProcessOptions } from "./process.js";
 import { PromptWatchdog } from "./prompt-watchdog.js";
-import { ResourceExhaustionTracker } from "./quota.js";
+import { ModelRetryTracker, StderrDiagnosticTracker } from "./quota.js";
 import {
 	decodeSessionState,
 	findSessionSelector,
@@ -55,7 +61,8 @@ export class AntigravityAcpConnection {
 	private readonly promptIdleTimeoutMs: number;
 	private readonly promptWorkIdleTimeoutMs: number;
 	private readonly watchdogs = new Map<string, PromptWatchdog>();
-	private readonly exhaustion = new Map<string, ResourceExhaustionTracker>();
+	private readonly exhaustion = new Map<string, ModelRetryTracker>();
+	private readonly diagnostics = new StderrDiagnosticTracker();
 	private readonly protocolFailure: Promise<never>;
 	private readonly processFailure: Promise<never>;
 	private readonly sessions = new Map<string, SessionState>();
@@ -71,6 +78,7 @@ export class AntigravityAcpConnection {
 		new PromptWatchdog(this.promptIdleTimeoutMs, this.promptWorkIdleTimeoutMs, () => undefined).dispose();
 		this.process = new AntigravityProcess(options);
 		this.process.onStderrLine((line) => {
+			this.diagnostics.noteStderrLine(line);
 			for (const tracker of this.exhaustion.values()) tracker.noteStderrLine(line);
 		});
 		let rejectProtocolFailure!: (error: Error) => void;
@@ -82,10 +90,11 @@ export class AntigravityAcpConnection {
 		void this.protocolFailure.catch(() => undefined);
 		this.processFailure = this.process.exited.then(({ code, signal, stderrTail }) => {
 			const status = signal ? `signal ${signal}` : `code ${String(code)}`;
-			const detail = stderrTail.trim() ? `: ${stderrTail.trim()}` : "";
+			const header = `Antigravity ACP process exited with ${status}`;
+			const detail = formatFailureStderr(stderrTail, this.diagnostics.parts, header);
 			throw new AntigravityAcpError(
 				"process_exit",
-				`Antigravity ACP process exited with ${status}${detail}`,
+				`${header}${detail}`,
 			);
 		});
 		// Process exit is expected during close; observe it here while active
@@ -104,6 +113,7 @@ export class AntigravityAcpConnection {
 		// resume. Opt into the full v1 surface, not the experimental v2 protocol.
 		this.connection = client({ name: "pi-antigravity-acp-provider" })
 			.onRequest(methods.client.session.requestPermission, async ({ params: request }) => {
+				this.diagnostics.reset();
 				this.exhaustion.get(request.sessionId)?.noteProgress();
 				const release = this.watchdogs.get(request.sessionId)?.beginPermission();
 				try {
@@ -113,6 +123,7 @@ export class AntigravityAcpConnection {
 				}
 			})
 			.onNotification(methods.client.session.update, async ({ params: notification }) => {
+				this.diagnostics.reset();
 				this.watchdogs.get(notification.sessionId)?.noteUpdate(notification);
 				this.exhaustion.get(notification.sessionId)?.noteProgress();
 				if (notification.update.sessionUpdate === "config_option_update") {
@@ -288,6 +299,8 @@ export class AntigravityAcpConnection {
 
 	/** A parked Pi tool gets the bounded work-inactivity window, not an absolute deadline. */
 	holdPromptWatchdog(sessionId: string): () => void {
+		this.diagnostics.reset();
+		this.exhaustion.get(sessionId)?.noteProgress();
 		return this.watchdogs.get(sessionId)?.hold() ?? (() => undefined);
 	}
 
@@ -415,17 +428,30 @@ export class AntigravityAcpConnection {
 		}
 		let rejectStall!: (error: Error) => void;
 		const stalled = new Promise<never>((_resolve, reject) => { rejectStall = reject; });
+		let exhaustion!: ModelRetryTracker;
 		const watchdog = new PromptWatchdog(this.promptIdleTimeoutMs, this.promptWorkIdleTimeoutMs, (busy, ms) => {
-			const detail = this.process.stderrTail.trim() ? `: ${this.process.stderrTail.trim()}` : "";
-			rejectStall(new AntigravityAcpError("timeout",
-				`Antigravity ACP session/prompt timed out: no ${busy ? "tool/permission " : ""}progress for ${ms}ms${detail}`));
+			const header = `Antigravity ACP session/prompt timed out: no ${busy ? "tool/permission " : ""}progress for ${ms}ms`;
+			const detail = formatFailureStderr(
+				this.process.stderrTail,
+				[...(exhaustion?.diagnosticParts ?? []), ...this.diagnostics.parts],
+				header,
+			);
+			rejectStall(new AntigravityAcpError("timeout", `${header}${detail}`));
 			void this.close().catch(() => undefined);
 		});
-		// agy retries a 429 without updating or answering; fail the prompt before the idle watchdog.
-		const exhaustion = new ResourceExhaustionTracker((message) => {
-			rejectStall(new AntigravityAcpError("quota", message));
-			void this.close().catch(() => undefined);
-		});
+		exhaustion = new ModelRetryTracker(
+			({ code, message }) => {
+				const detail = code === "model"
+					? formatFailureStderr(this.process.stderrTail, exhaustion.diagnosticParts, message, {
+						preserveRetryable: true,
+					})
+					: "";
+				const fullMessage = detail ? `${message.replace(/\.$/u, "")}${detail}` : message;
+				rejectStall(new AntigravityAcpError(code, fullMessage));
+				void this.close().catch(() => undefined);
+			},
+			() => watchdog.pause(),
+		);
 		this.watchdogs.set(request.sessionId, watchdog);
 		this.exhaustion.set(request.sessionId, exhaustion);
 		watchdog.arm();
@@ -453,9 +479,10 @@ export class AntigravityAcpConnection {
 				this.processFailure,
 				new Promise<never>((_resolve, reject) => {
 					timer = setTimeout(() => {
-						const detail = this.process.stderrTail.trim() ? `: ${this.process.stderrTail.trim()}` : "";
+						const header = `Antigravity ACP ${phase} timed out after ${timeoutMs}ms`;
+						const detail = formatFailureStderr(this.process.stderrTail, this.diagnostics.parts, header);
 						void this.close();
-						reject(new AntigravityAcpError("timeout", `Antigravity ACP ${phase} timed out after ${timeoutMs}ms${detail}`));
+						reject(new AntigravityAcpError("timeout", `${header}${detail}`));
 					}, timeoutMs);
 					timer.unref?.();
 				}),
@@ -492,8 +519,36 @@ function classifyError(error: unknown): Error {
 	return error instanceof Error ? error : new Error(String(error));
 }
 
+const NON_RETRYABLE_TAIL_KEYWORDS =
+	/GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|subscription_sharing_usage_limit_exceeded|subscription_sharing_workplace_individual_usage_limit_exceeded|"code"\s*:\s*"?1308(?![0-9])/giu;
+
+function formatFailureStderr(
+	stderrTail: string,
+	diagnosticParts: readonly string[] = [],
+	existingHeader = "",
+	options?: { preserveRetryable?: boolean },
+): string {
+	let tail = redactTail(stderrTail, ERROR_STDERR_TAIL_LIMIT).trim();
+	if (options?.preserveRetryable && tail) {
+		tail = tail.replace(NON_RETRYABLE_TAIL_KEYWORDS, "<redacted>");
+	}
+	const seen = new Set<string>();
+	const missing = diagnosticParts
+		.map((part) => part.trim())
+		.filter((part) => {
+			if (!part || seen.has(part)) return false;
+			seen.add(part);
+			return !existingHeader.includes(part) && !tail.includes(part);
+		});
+	const summary = missing.join("; ");
+	if (summary) {
+		return tail ? `: ${summary} | ${tail}` : `: ${summary}`;
+	}
+	return tail ? `: ${tail}` : "";
+}
+
 function structuredErrorDetail(data: unknown): string | undefined {
 	if (!data || typeof data !== "object") return undefined;
 	const detail = (data as { details?: unknown }).details;
-	return typeof detail === "string" && detail.trim() ? redact(detail.trim()) : undefined;
+	return typeof detail === "string" && detail.trim() ? redactBounded(detail.trim(), 3_584, 512) : undefined;
 }

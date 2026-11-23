@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
-import { AntigravityAcpError } from "../src/acp/errors.js";
+import { AntigravityAcpError, errorMessage } from "../src/acp/errors.js";
 import { findSessionSelector, sessionModels, sessionModes } from "../src/acp/session-state.js";
 
 const fakeAgent = fileURLToPath(new URL("./fixtures/fake-agent.mjs", import.meta.url));
@@ -265,6 +265,11 @@ describe("AntigravityAcpConnection", () => {
 		try {
 			await connection.initialize();
 			const session = await connection.newSession(process.cwd());
+			connection.process.child.stderr.push(`${"startup-noise ".repeat(500)}\n`);
+			connection.process.child.stderr.push(
+				"W1122 21:28:15.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out\n",
+			);
+			connection.process.child.stderr.push(`${"post-error-frame ".repeat(210)}\n`);
 			connection.process.child.stderr.push(
 				"WARNING: System step error (HTTP 502): The model is currently unreachable. api_key=AIza1234567890abcdefghijkl\n",
 			);
@@ -273,11 +278,13 @@ describe("AntigravityAcpConnection", () => {
 				prompt: [{ type: "text", text: "hang" }],
 			}).catch((cause: unknown) => cause);
 			expect(error).toBeInstanceOf(Error);
-			expect((error as Error).message).toContain(
-				"Antigravity ACP session/prompt timed out: no progress for 40ms: WARNING: System step error (HTTP 502): The model is currently unreachable.",
-			);
-			expect((error as Error).message).toContain("<redacted>");
-			expect((error as Error).message).not.toContain("AIza1234567890abcdefghijkl");
+			const formatted = errorMessage(error);
+			expect(formatted.length).toBeLessThanOrEqual(4_096);
+			expect(formatted).toContain("Antigravity ACP session/prompt timed out: no progress for 40ms:");
+			expect(formatted).toContain("Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out");
+			expect(formatted).toContain("WARNING: System step error (HTTP 502): The model is currently unreachable.");
+			expect(formatted).toContain("<redacted>");
+			expect(formatted).not.toContain("AIza1234567890abcdefghijkl");
 		} finally {
 			await connection.close();
 		}
@@ -366,6 +373,246 @@ describe("AntigravityAcpConnection", () => {
 				await connection.process.exited;
 				expect(Date.now() - started).toBeLessThan(3_500);
 				expect(connection.process.alive).toBe(false);
+			} finally { await connection.close(); }
+		});
+	});
+
+	describe("when agy silently retries transient 5xx and 408 errors", () => {
+		const unavailableAgent = (stepMs = 20, idleMs = 2_500) => new AntigravityAcpConnection({
+			cwd: process.cwd(),
+			command: process.execPath,
+			args: [fakeAgent, "upstream-unavailable"],
+			promptIdleTimeoutMs: idleMs,
+			env: { ...process.env, FAKE_RETRY_STEP_MS: String(stepMs) },
+		});
+		const prompt = (connection: AntigravityAcpConnection, sessionId: string, text: string, signal?: AbortSignal) =>
+			connection.prompt({ sessionId, prompt: [{ type: "text", text }] }, signal);
+
+		it("fails the prompt fast on the second 5xx retry with upstream cause and keeps the latest redacted stderrTail", async () => {
+			const connection = unavailableAgent();
+			try {
+				const session = await connection.newSession(process.cwd());
+				const started = Date.now();
+				const error = await prompt(connection, session.sessionId, "proxy-timeout Reply with exactly: PONG").catch((cause: unknown) => cause);
+				expect(Date.now() - started).toBeLessThan(1_500);
+				expect(error).toBeInstanceOf(AntigravityAcpError);
+				expect((error as AntigravityAcpError).code).toBe("model");
+				const formatted = errorMessage(error);
+				expect(formatted.length).toBeLessThanOrEqual(4_096);
+				expect(formatted).toContain(
+					"Antigravity model service temporarily unavailable (HTTP 502): Bad Gateway: Failed to connect to backend API; Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out; agy retried 2 times, next retry in 5.22s, without a reply:",
+				);
+				expect(formatted).toContain("access_token=<redacted>");
+				expect(formatted).toContain("Encountered retryable api error. retrying in 5.217655808s");
+				expect(formatted).not.toContain("ya29.fake-secret-access-token");
+				await connection.process.exited;
+				expect(connection.process.alive).toBe(false);
+				expect(connection.process.stderrTail).toContain("Error 502, Message: Bad Gateway");
+				expect(connection.process.stderrTail).toContain("access_token=<redacted>");
+				expect(connection.process.stderrTail).not.toContain("ya29.fake-secret-access-token");
+			} finally { await connection.close(); }
+		});
+
+		it("completes a turn that recovers from a single transient 502 retry", async () => {
+			const updates: string[] = [];
+			const connection = unavailableAgent();
+			connection.setHandlers({ onUpdate: (notification) => { updates.push(notification.update.sessionUpdate); } });
+			try {
+				const session = await connection.newSession(process.cwd());
+				expect((await prompt(connection, session.sessionId, "retries 1")).stopReason).toBe("end_turn");
+				expect(updates).toEqual(["agent_message_chunk"]);
+				expect(connection.process.alive).toBe(true);
+			} finally { await connection.close(); }
+		});
+
+		it("recovers from a 305s slow-read 502 when the single retry streams after 45s", async () => {
+			const connection = new AntigravityAcpConnection({
+				cwd: path.dirname(fakeAgent),
+				command: process.execPath,
+				args: [fakeAgent],
+			});
+			let promptId: string | number | undefined;
+			connection.process.onStderrLine((line) => {
+				const match = /^hanging-prompt-id:(.+)$/u.exec(line);
+				if (match) promptId = Number.isNaN(Number(match[1])) ? match[1] : Number(match[1]);
+			});
+			try {
+				const session = await connection.newSession(process.cwd());
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+				const pending = prompt(connection, session.sessionId, "hang-emit-id");
+				while (promptId === undefined) await new Promise((resolve) => setImmediate(resolve));
+
+				vi.advanceTimersByTime(305_000);
+				connection.process.child.stderr.push(
+					"W1122 21:28:15.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out\n" +
+					"I1122 21:28:15.000200 48213 local_connection.py:553] Error 502, Message: Bad Gateway: Failed to connect to backend API, Status: 502 Bad Gateway, Details: []\n" +
+					"I1122 21:28:15.000300 48213 planner_generator.go:359] Encountered retryable api error. retrying in 4s\n",
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+
+				vi.advanceTimersByTime(49_000);
+				connection.process.child.stdout.push(
+					`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: session.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "HEALED" } } } })}\n` +
+					`${JSON.stringify({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } })}\n`,
+				);
+				expect((await pending).stopReason).toBe("end_turn");
+				expect(connection.process.alive).toBe(true);
+			} finally {
+				vi.useRealTimers();
+				await connection.close();
+			}
+		});
+
+		it("surfaces structured 502 cause on consecutive 305s slow-read timeouts instead of a blind 600s watchdog timeout", async () => {
+			const connection = new AntigravityAcpConnection({
+				cwd: path.dirname(fakeAgent),
+				command: process.execPath,
+				args: [fakeAgent],
+			});
+			let promptId: string | number | undefined;
+			connection.process.onStderrLine((line) => {
+				const match = /^hanging-prompt-id:(.+)$/u.exec(line);
+				if (match) promptId = Number.isNaN(Number(match[1])) ? match[1] : Number(match[1]);
+			});
+			try {
+				const session = await connection.newSession(process.cwd());
+				connection.process.child.stderr.push(`${"loadCodeAssist ".repeat(500)}\n`);
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+				let settled = false;
+				const pending = prompt(connection, session.sessionId, "hang-emit-id").finally(() => { settled = true; });
+				void pending.catch(() => undefined);
+				while (promptId === undefined) await new Promise((resolve) => setImmediate(resolve));
+
+				vi.advanceTimersByTime(305_000);
+				connection.process.child.stderr.push(
+					"W1122 21:28:15.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out\n" +
+					"I1122 21:28:15.000200 48213 local_connection.py:553] Error 502, Message: Bad Gateway: Failed to connect to backend API, Status: 502 Bad Gateway, Details: []\n" +
+					"I1122 21:28:15.000300 48213 planner_generator.go:359] Encountered retryable api error. retrying in 4s\n",
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+
+				vi.advanceTimersByTime(309_000);
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(settled).toBe(false);
+
+				connection.process.child.stderr.push(
+					"W1122 21:33:24.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out\n" +
+					"I1122 21:33:24.000200 48213 local_connection.py:553] Error 502, Message: Bad Gateway: Failed to connect to backend API, Status: 502 Bad Gateway, Details: []\n" +
+					"I1122 21:33:24.000300 48213 planner_generator.go:359] Encountered retryable api error. retrying in 5.77s\n",
+				);
+				const error = await pending.catch((cause: unknown) => cause);
+				expect(error).toBeInstanceOf(AntigravityAcpError);
+				expect((error as AntigravityAcpError).code).toBe("model");
+				const formatted = errorMessage(error);
+				expect(formatted).toContain("HTTP 502");
+				expect(formatted).toContain("The read operation timed out");
+				expect(formatted).toContain("agy retried 2 times, next retry in 5.77s");
+			} finally {
+				vi.useRealTimers();
+				await connection.close();
+			}
+		});
+
+		it("lets the accepted retry window outlive a shorter promptIdleTimeoutMs and preserves long structured ACP error tails", async () => {
+			const connection = new AntigravityAcpConnection({
+				cwd: path.dirname(fakeAgent),
+				command: process.execPath,
+				args: [fakeAgent],
+				promptIdleTimeoutMs: 60_000,
+			});
+			let promptId: string | number | undefined;
+			connection.process.onStderrLine((line) => {
+				const match = /^hanging-prompt-id:(.+)$/u.exec(line);
+				if (match) promptId = Number.isNaN(Number(match[1])) ? match[1] : Number(match[1]);
+			});
+			try {
+				const session = await connection.newSession(process.cwd());
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+				let settled = false;
+				const pending = prompt(connection, session.sessionId, "hang-emit-id").finally(() => { settled = true; });
+				void pending.catch(() => undefined);
+				while (promptId === undefined) await new Promise((resolve) => setImmediate(resolve));
+
+				vi.advanceTimersByTime(10_000);
+				connection.process.child.stderr.push(
+					"I1122 21:28:15.000200 48213 local_connection.py:553] Error 502, Message: Bad Gateway: Failed to connect to backend API, Status: 502 Bad Gateway, Details: []\n" +
+					"I1122 21:28:15.000300 48213 planner_generator.go:359] Encountered retryable api error. retrying in 4s\n",
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+
+				vi.advanceTimersByTime(120_000);
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(settled).toBe(false);
+
+				connection.process.child.stderr.push(
+					"W1122 21:33:15.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: Remote end closed connection without response\n",
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+				vi.advanceTimersByTime(214_000);
+				const error = await pending.catch((cause: unknown) => cause);
+				expect(error).toBeInstanceOf(AntigravityAcpError);
+				expect((error as AntigravityAcpError).code).toBe("model");
+				const formatted = errorMessage(error);
+				expect(formatted).toContain("Remote end closed connection without response");
+				expect(formatted).toContain("agy retried 1 time, next retry in 4s, without a reply");
+			} finally {
+				vi.useRealTimers();
+				await connection.close();
+			}
+
+			const structuredConn = new AntigravityAcpConnection({
+				cwd: path.dirname(fakeAgent),
+				command: process.execPath,
+				args: [fakeAgent],
+			});
+			let secondPromptId: string | number | undefined;
+			structuredConn.process.onStderrLine((line) => {
+				const match = /^hanging-prompt-id:(.+)$/u.exec(line);
+				if (match) secondPromptId = Number.isNaN(Number(match[1])) ? match[1] : Number(match[1]);
+			});
+			try {
+				const session = await structuredConn.newSession(process.cwd());
+				const pending = prompt(structuredConn, session.sessionId, "hang-emit-id");
+				void pending.catch(() => undefined);
+				while (secondPromptId === undefined) await new Promise((resolve) => setImmediate(resolve));
+				structuredConn.process.child.stdout.push(
+					`${JSON.stringify({
+						jsonrpc: "2.0",
+						id: secondPromptId,
+						error: {
+							code: -32603,
+							message: "Internal error",
+							data: {
+								details: `${"trace-frame ".repeat(450)}\nproxy_server.py:222] Proxy failed to connect to CCPA API: Remote end closed connection\nAPI_ERROR: HTTP 502 Bad Gateway`,
+							},
+						},
+					})}\n`,
+				);
+				const structuredError = await pending.catch((cause: unknown) => cause);
+				const formatted = errorMessage(structuredError);
+				expect(formatted.length).toBeLessThanOrEqual(4_096);
+				expect(formatted).toContain("Antigravity ACP error -32603: Internal error:");
+				expect(formatted).toContain("proxy_server.py:222] Proxy failed to connect to CCPA API: Remote end closed connection");
+				expect(formatted).toContain("API_ERROR: HTTP 502 Bad Gateway");
+			} finally {
+				await structuredConn.close();
+			}
+		});
+
+		it("resets the transient retry count on streaming updates and permission requests", async () => {
+			const updates: string[] = [];
+			let permissions = 0;
+			const connection = unavailableAgent();
+			connection.setHandlers({
+				onUpdate: (notification) => { updates.push(notification.update.sessionUpdate); },
+				onPermission: async () => { permissions++; return { outcome: { outcome: "selected", optionId: "allow-once" } }; },
+			});
+			try {
+				const session = await connection.newSession(process.cwd());
+				expect((await prompt(connection, session.sessionId, "retries 1 progress")).stopReason).toBe("end_turn");
+				expect((await prompt(connection, session.sessionId, "retries 1 permission")).stopReason).toBe("end_turn");
+				expect(permissions).toBe(1);
+				expect(updates).toEqual(["agent_thought_chunk", "agent_message_chunk", "agent_message_chunk"]);
 			} finally { await connection.close(); }
 		});
 	});

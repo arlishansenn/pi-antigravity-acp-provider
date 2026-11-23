@@ -72,6 +72,19 @@ describe("bounded prompt progress watchdog", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
+	it("suspends its idle countdown while paused and resumes when progress arrives", () => {
+		const { watch, timeout } = watchdog();
+		watch.pause();
+		vi.advanceTimersByTime(500);
+		expect(timeout).not.toHaveBeenCalled();
+		watch.noteUpdate(update);
+		vi.advanceTimersByTime(99);
+		expect(timeout).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		expect(timeout).toHaveBeenCalledExactlyOnceWith(false, 100);
+		watch.dispose();
+	});
+
 	it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648])("rejects invalid timeout %s", (ms) => {
 		expect(() => new PromptWatchdog(ms, 1000, () => undefined)).toThrow(RangeError);
 		expect(() => new PromptWatchdog(100, ms, () => undefined)).toThrow(RangeError);
