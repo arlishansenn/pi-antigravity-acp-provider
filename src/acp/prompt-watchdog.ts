@@ -57,6 +57,11 @@ export class PromptWatchdog {
 		return this.acquire("permissions");
 	}
 
+	pause(): void {
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+	}
+
 	dispose(): void {
 		this.disposed = true;
 		if (this.timer) clearTimeout(this.timer);

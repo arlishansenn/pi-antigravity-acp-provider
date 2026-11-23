@@ -24,9 +24,14 @@ export function abortError(message = "Antigravity ACP request aborted"): Antigra
 	return new AntigravityAcpError("aborted", message);
 }
 
+export const ERROR_MESSAGE_LIMIT = 4_096;
+export const ERROR_HEADER_LIMIT = 1_024;
+export const ERROR_STDERR_TAIL_LIMIT = 2_048;
+const TRUNCATION_MARKER = " ... ";
+
 export function errorMessage(cause: unknown): string {
-	if (cause instanceof Error && cause.message) return redact(cause.message);
-	return redact(String(cause));
+	const raw = cause instanceof Error && cause.message ? cause.message : String(cause);
+	return redactBounded(raw, ERROR_MESSAGE_LIMIT, ERROR_HEADER_LIMIT);
 }
 
 function scrubSecrets(text: string): string {
@@ -42,9 +47,24 @@ function scrubSecrets(text: string): string {
 }
 
 export function redact(text: string): string {
-	return scrubSecrets(text).slice(0, 4_096);
+	return scrubSecrets(text).slice(0, ERROR_MESSAGE_LIMIT);
 }
 
-export function redactTail(text: string): string {
-	return scrubSecrets(text).slice(-4_096);
+export function redactTail(text: string, limit = ERROR_MESSAGE_LIMIT): string {
+	if (limit <= 0) return "";
+	return scrubSecrets(text).slice(-limit);
+}
+
+export function redactBounded(
+	text: string,
+	limit = ERROR_MESSAGE_LIMIT,
+	headLimit = ERROR_HEADER_LIMIT,
+): string {
+	if (limit <= 0) return "";
+	const clean = scrubSecrets(text);
+	if (clean.length <= limit) return clean;
+	const head = Math.max(0, Math.min(headLimit, Math.floor(limit / 2)));
+	const tail = limit - head - TRUNCATION_MARKER.length;
+	if (head === 0 || tail <= 0) return clean.slice(-limit);
+	return `${clean.slice(0, head)}${TRUNCATION_MARKER}${clean.slice(-tail)}`;
 }
