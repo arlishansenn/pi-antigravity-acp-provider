@@ -373,11 +373,13 @@ for await (const line of rl) {
 				if (attempt < retries) {
 					const delay = delays[Math.min(attempt, delays.length - 1)];
 					if (isUnavailable) {
+						if (text.includes("proxy-timeout")) {
+							log("proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out");
+						}
 						process.stderr.write(`I1122 23:33:00.027626 6164262912 local_connection.py:553] harness stderr: received model response error: Error ${statusCode}, Message: Bad Gateway: Failed to con`);
 						process.stderr.write(`nect to backend API, Status: ${statusCode} Bad Gateway, Details: []\n`);
 						log(`harness stderr: ERROR: logging before google.Init: I1122 23:33:00.027643 117 planner_generator.go:359] Encountered retryable api error. retrying in ${delay}. Error (The model is currently unreachable.): Error ${statusCode}, Message: Bad Gateway: Failed to connect to backend API, Status: ${statusCode} Bad Gateway, Details: []`);
 					} else {
-						// Split mid-line: stderr chunks do not follow line boundaries.
 						process.stderr.write("W1114 22:07:04.512301 48213 http_client.go:211] Error 429, Message: Resource has been ex");
 						process.stderr.write("hausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED\n");
 						log(`planner_generator.go:359 Encountered retryable api error. retrying in ${delay}`);
@@ -452,6 +454,9 @@ for await (const line of rl) {
 		}
 		if (!continuing && text.includes("hang")) {
 			hangingPromptId = id;
+			if (text.includes("hang-emit-id")) {
+				process.stderr.write(`hanging-prompt-id:${String(id)}\n`);
+			}
 			continue;
 		}
 		if (!continuing && text.includes("permission")) {

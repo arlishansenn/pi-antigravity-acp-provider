@@ -214,9 +214,9 @@ describe("ModelRetryTracker", () => {
 		track.dispose();
 	});
 
-	it("ignores non-retryable API errors, bare markers, prompt text and model names", () => {
+	it("ignores non-retryable 4xx API errors, bare markers, prompt text and model names", () => {
 		const { track, onFailure } = tracker();
-		for (const status of [400, 401, 403, 404, 500]) {
+		for (const status of [400, 401, 403, 404, 422]) {
 			track.noteStderrLine(transientLine(status));
 			track.noteStderrLine(retry("4s"));
 		}
@@ -225,43 +225,79 @@ describe("ModelRetryTracker", () => {
 			track.noteStderrLine(exhausted);
 			track.noteStderrLine("I1114 22:07:04.000002 48213 local_connection.py:553] model gemini-4-hydrogen ready");
 		}
-		vi.advanceTimersByTime(60_000);
+		vi.advanceTimersByTime(400_000);
 		expect(onFailure).not.toHaveBeenCalled();
 		track.dispose();
 	});
 
-	it.each([408, 502, 503, 504])("fails on the third HTTP %i retry with a retryable model error", (status) => {
+	it.each([408, 500, 502, 503, 504, 524])("tolerates one HTTP %i retry and fails immediately on the second with upstream cause", (status) => {
 		const { track, onFailure } = tracker();
 		track.noteStderrLine(transientLine(status)); track.noteStderrLine(retry("4s"));
-		track.noteStderrLine(transientLine(status)); track.noteStderrLine(retry("5.22s"));
 		expect(onFailure).not.toHaveBeenCalled();
-		track.noteStderrLine(transientLine(status)); track.noteStderrLine(retry("10.71s"));
+		track.noteStderrLine(transientLine(status)); track.noteStderrLine(retry("5.22s"));
 		expect(onFailure).toHaveBeenCalledExactlyOnceWith({
 			code: "model",
-			message: `Antigravity model service temporarily unavailable (HTTP ${status}): agy retried 3 times, next retry in 10.71s, without a reply.`,
+			message: `Antigravity model service temporarily unavailable (HTTP ${status}): Bad Gateway: Failed to connect to backend API; agy retried 2 times, next retry in 5.22s, without a reply.`,
 		});
 		track.dispose();
 	});
 
-	it("cuts off a silent upstream hang after a counted 502 retry", () => {
+	it("captures proxy_server.py transport timeout cause and System step error 5xx lines", () => {
 		const { track, onFailure } = tracker();
-		track.noteStderrLine(transientLine(502)); track.noteStderrLine(retry("4s"));
-		vi.advanceTimersByTime(4_000 + MODEL_RETRY_STARTUP_MARGIN_MS - 1);
+		track.noteStderrLine("W1122 21:28:15.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out");
+		track.noteStderrLine(`${transientLine(502)}, Status: 502 Bad Gateway, Details: []`);
+		track.noteStderrLine(`${retry("4s")}. Error (The model is currently unreachable.): ${transientLine(502)}, Status: 502 Bad Gateway, Details: []`);
+		expect(onFailure).not.toHaveBeenCalled();
+
+		track.noteStderrLine("WARNING: System step error (HTTP 502): The model is currently unreachable.");
+		track.noteStderrLine(retry("5.77s"));
+		expect(onFailure).toHaveBeenCalledExactlyOnceWith({
+			code: "model",
+			message: "Antigravity model service temporarily unavailable (HTTP 502): The model is currently unreachable.; agy retried 2 times, next retry in 5.77s, without a reply.",
+		});
+		track.dispose();
+	});
+
+	it("preserves proxy_server.py cause when the first 502 retry exhausts its 330s slow-read window", () => {
+		const { track, onFailure } = tracker();
+		track.noteStderrLine("W1122 21:28:15.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out");
+		track.noteStderrLine(`${transientLine(502)}, Status: 502 Bad Gateway, Details: []`);
+		track.noteStderrLine(`${retry("4s")}. Error (The model is currently unreachable.): ${transientLine(502)}, Status: 502 Bad Gateway, Details: []`);
+		vi.advanceTimersByTime(4_000 + 330_000 - 1);
 		expect(onFailure).not.toHaveBeenCalled();
 		vi.advanceTimersByTime(1);
 		expect(onFailure).toHaveBeenCalledExactlyOnceWith({
 			code: "model",
-			message: "Antigravity model service temporarily unavailable (HTTP 502): agy retried 1 time, next retry in 4s, without a reply.",
+			message: "Antigravity model service temporarily unavailable (HTTP 502): Bad Gateway: Failed to connect to backend API; Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: The read operation timed out; agy retried 1 time, next retry in 4s, without a reply.",
 		});
+		track.dispose();
+	});
+
+	it("reports newer diagnostics written after the accepted retry log and keeps the tail of long proxy lines", () => {
+		const { track, onFailure } = tracker();
+		track.noteStderrLine(`${transientLine(502)}, Status: 502 Bad Gateway, Details: []`);
+		track.noteStderrLine(retry("4s"));
+		vi.advanceTimersByTime(300_000);
+		track.noteStderrLine(
+			`W1122 21:33:15.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: ${"upstream-hop-context ".repeat(20)}: Socket operation failed to CCPA API: TLS handshake timed out`,
+		);
+		track.noteStderrLine("I1122 21:33:15.000200 48213 local_connection.py:553] Error 504, Message: Gateway Timeout: backend deadline exceeded, Status: 504 Gateway Timeout, Details: []");
+		vi.advanceTimersByTime(34_000);
+		expect(onFailure).toHaveBeenCalledOnce();
+		const failure = onFailure.mock.calls[0]![0]!;
+		expect(failure.code).toBe("model");
+		expect(failure.message).toContain("HTTP 504");
+		expect(failure.message).toContain("Gateway Timeout: backend deadline exceeded");
+		expect(failure.message).toContain("Socket operation failed to CCPA API: TLS handshake timed out");
+		expect(failure.message).toContain("agy retried 1 time, next retry in 4s, without a reply.");
 		track.dispose();
 	});
 
 	it("resets transient retry state once model progress arrives", () => {
 		const { track, onFailure } = tracker();
 		track.noteStderrLine(transientLine(502)); track.noteStderrLine(retry("4s"));
-		track.noteStderrLine(transientLine(502)); track.noteStderrLine(retry("5.22s"));
 		track.noteProgress();
-		vi.advanceTimersByTime(60_000);
+		vi.advanceTimersByTime(400_000);
 		track.noteStderrLine(transientLine(502)); track.noteStderrLine(retry("4s"));
 		expect(onFailure).not.toHaveBeenCalled();
 		track.dispose();
@@ -271,10 +307,9 @@ describe("ModelRetryTracker", () => {
 		const { track, onFailure } = tracker();
 		track.noteStderrLine(exhausted); track.noteStderrLine(retry("4s"));
 		track.noteStderrLine(transientLine(502)); track.noteStderrLine(retry("5s"));
-		track.noteStderrLine(transientLine(502)); track.noteStderrLine(retry("6s"));
 		expect(onFailure).toHaveBeenCalledExactlyOnceWith({
 			code: "model",
-			message: "Antigravity model service temporarily unavailable (HTTP 502): agy retried 3 times, next retry in 6s, without a reply.",
+			message: "Antigravity model service temporarily unavailable (HTTP 502): Bad Gateway: Failed to connect to backend API; agy retried 2 times, next retry in 5s, without a reply.",
 		});
 		track.dispose();
 	});
