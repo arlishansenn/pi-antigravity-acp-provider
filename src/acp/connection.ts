@@ -25,7 +25,11 @@ import {
 } from "./errors.js";
 import { AntigravityProcess, type AntigravityProcessOptions } from "./process.js";
 import { PromptWatchdog } from "./prompt-watchdog.js";
-import { ModelRetryTracker, StderrDiagnosticTracker } from "./quota.js";
+import {
+	isGenericQuotaDiagnostic,
+	scrubNonRetryableKeywords,
+	StderrDiagnosticTracker,
+} from "./quota.js";
 import {
 	decodeSessionState,
 	findSessionSelector,
@@ -61,7 +65,6 @@ export class AntigravityAcpConnection {
 	private readonly promptIdleTimeoutMs: number;
 	private readonly promptWorkIdleTimeoutMs: number;
 	private readonly watchdogs = new Map<string, PromptWatchdog>();
-	private readonly exhaustion = new Map<string, ModelRetryTracker>();
 	private readonly diagnostics = new StderrDiagnosticTracker();
 	private readonly protocolFailure: Promise<never>;
 	private readonly processFailure: Promise<never>;
@@ -79,7 +82,7 @@ export class AntigravityAcpConnection {
 		this.process = new AntigravityProcess(options);
 		this.process.onStderrLine((line) => {
 			this.diagnostics.noteStderrLine(line);
-			for (const tracker of this.exhaustion.values()) tracker.noteStderrLine(line);
+			for (const watchdog of this.watchdogs.values()) watchdog.noteStderrLine(line);
 		});
 		let rejectProtocolFailure!: (error: Error) => void;
 		this.protocolFailure = new Promise<never>((_resolve, reject) => {
@@ -114,7 +117,6 @@ export class AntigravityAcpConnection {
 		this.connection = client({ name: "pi-antigravity-acp-provider" })
 			.onRequest(methods.client.session.requestPermission, async ({ params: request }) => {
 				this.diagnostics.reset();
-				this.exhaustion.get(request.sessionId)?.noteProgress();
 				const release = this.watchdogs.get(request.sessionId)?.beginPermission();
 				try {
 					return (await this.handlers.onPermission?.(request)) ?? { outcome: { outcome: "cancelled" } };
@@ -125,7 +127,6 @@ export class AntigravityAcpConnection {
 			.onNotification(methods.client.session.update, async ({ params: notification }) => {
 				this.diagnostics.reset();
 				this.watchdogs.get(notification.sessionId)?.noteUpdate(notification);
-				this.exhaustion.get(notification.sessionId)?.noteProgress();
 				if (notification.update.sessionUpdate === "config_option_update") {
 					this.updateSessionState(notification.sessionId, notification.update);
 				} else if (notification.update.sessionUpdate === "current_mode_update") {
@@ -300,7 +301,6 @@ export class AntigravityAcpConnection {
 	/** A parked Pi tool gets the bounded work-inactivity window, not an absolute deadline. */
 	holdPromptWatchdog(sessionId: string): () => void {
 		this.diagnostics.reset();
-		this.exhaustion.get(sessionId)?.noteProgress();
 		return this.watchdogs.get(sessionId)?.hold() ?? (() => undefined);
 	}
 
@@ -428,32 +428,32 @@ export class AntigravityAcpConnection {
 		}
 		let rejectStall!: (error: Error) => void;
 		const stalled = new Promise<never>((_resolve, reject) => { rejectStall = reject; });
-		let exhaustion!: ModelRetryTracker;
-		const watchdog = new PromptWatchdog(this.promptIdleTimeoutMs, this.promptWorkIdleTimeoutMs, (busy, ms) => {
-			const header = `Antigravity ACP session/prompt timed out: no ${busy ? "tool/permission " : ""}progress for ${ms}ms`;
+		let watchdog!: PromptWatchdog;
+		watchdog = new PromptWatchdog(this.promptIdleTimeoutMs, this.promptWorkIdleTimeoutMs, (failure) => {
+			if (failure.kind === "timeout") {
+				const header = `Antigravity ACP session/prompt timed out: no ${failure.busy ? "tool/permission " : ""}progress for ${failure.timeoutMs}ms`;
+				const detail = formatFailureStderr(
+					this.process.stderrTail,
+					[...watchdog.diagnosticParts, ...this.diagnostics.parts],
+					header,
+				);
+				rejectStall(new AntigravityAcpError("timeout", `${header}${detail}`));
+				void this.close().catch(() => undefined);
+				return;
+			}
+			const isModelFailure = failure.code === "model";
 			const detail = formatFailureStderr(
-				this.process.stderrTail,
-				[...(exhaustion?.diagnosticParts ?? []), ...this.diagnostics.parts],
-				header,
+				isModelFailure ? this.process.stderrTail : "",
+				[...watchdog.diagnosticParts, ...this.diagnostics.parts],
+				failure.message,
+				isModelFailure ? { preserveRetryable: true } : { omitGenericQuota: true },
 			);
-			rejectStall(new AntigravityAcpError("timeout", `${header}${detail}`));
+			const assembled = detail ? `${failure.message.replace(/\.$/u, "")}${detail}` : failure.message;
+			const fullMessage = isModelFailure ? scrubNonRetryableKeywords(assembled) : assembled;
+			rejectStall(new AntigravityAcpError(failure.code, fullMessage));
 			void this.close().catch(() => undefined);
 		});
-		exhaustion = new ModelRetryTracker(
-			({ code, message }) => {
-				const detail = code === "model"
-					? formatFailureStderr(this.process.stderrTail, exhaustion.diagnosticParts, message, {
-						preserveRetryable: true,
-					})
-					: "";
-				const fullMessage = detail ? `${message.replace(/\.$/u, "")}${detail}` : message;
-				rejectStall(new AntigravityAcpError(code, fullMessage));
-				void this.close().catch(() => undefined);
-			},
-			() => watchdog.pause(),
-		);
 		this.watchdogs.set(request.sessionId, watchdog);
-		this.exhaustion.set(request.sessionId, exhaustion);
 		watchdog.arm();
 		try {
 			return await Promise.race([
@@ -462,9 +462,7 @@ export class AntigravityAcpConnection {
 			]);
 		} finally {
 			watchdog.dispose();
-			exhaustion.dispose();
 			this.watchdogs.delete(request.sessionId);
-			this.exhaustion.delete(request.sessionId);
 		}
 	}
 
@@ -519,26 +517,28 @@ function classifyError(error: unknown): Error {
 	return error instanceof Error ? error : new Error(String(error));
 }
 
-const NON_RETRYABLE_TAIL_KEYWORDS =
-	/GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|subscription_sharing_usage_limit_exceeded|subscription_sharing_workplace_individual_usage_limit_exceeded|"code"\s*:\s*"?1308(?![0-9])/giu;
-
 function formatFailureStderr(
 	stderrTail: string,
 	diagnosticParts: readonly string[] = [],
 	existingHeader = "",
-	options?: { preserveRetryable?: boolean },
+	options?: { preserveRetryable?: boolean; omitGenericQuota?: boolean },
 ): string {
-	let tail = redactTail(stderrTail, ERROR_STDERR_TAIL_LIMIT).trim();
+	let tail = redactTail(stderrTail, ERROR_STDERR_TAIL_LIMIT).replace(/^[:;\s]+/u, "").trim();
 	if (options?.preserveRetryable && tail) {
-		tail = tail.replace(NON_RETRYABLE_TAIL_KEYWORDS, "<redacted>");
+		tail = scrubNonRetryableKeywords(tail);
 	}
 	const seen = new Set<string>();
 	const missing = diagnosticParts
-		.map((part) => part.trim())
+		.map((raw) => {
+			const trimmed = raw.trim();
+			return options?.preserveRetryable ? scrubNonRetryableKeywords(trimmed) : trimmed;
+		})
 		.filter((part) => {
 			if (!part || seen.has(part)) return false;
+			if (options?.omitGenericQuota && isGenericQuotaDiagnostic(part)) return false;
 			seen.add(part);
-			return !existingHeader.includes(part) && !tail.includes(part);
+			const core = part.replace(/^(?:Error \d{3},\s*Message:\s*|System step error \(HTTP \d{3}\):\s*)/u, "");
+			return !existingHeader.includes(part) && (!core || !existingHeader.includes(core)) && !tail.includes(part);
 		});
 	const summary = missing.join("; ");
 	if (summary) {
