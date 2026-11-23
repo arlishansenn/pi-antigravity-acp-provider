@@ -1,8 +1,10 @@
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { PromptWatchdog } from "../src/acp/prompt-watchdog.js";
 import {
 	MODEL_RETRY_STARTUP_MARGIN_MS,
 	MODEL_RETRY_UNPARSED_DELAY_MS,
-	ModelRetryTracker,
 	quotaExhaustion,
 } from "../src/acp/quota.js";
 
@@ -40,15 +42,30 @@ describe("quotaExhaustion", () => {
 const exhausted = "W1114 22:07:04.512301 48213 local_connection.py:553] Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED";
 const retry = (delay: string) => `I1114 22:07:04.512398 48213 planner_generator.go:359] Encountered retryable api error. retrying in ${delay}`;
 
-describe("ModelRetryTracker", () => {
+describe("ModelRetryState via PromptWatchdog", () => {
 	afterEach(() => vi.useRealTimers());
 	const transientLine = (status: number) =>
 		`W1122 13:34:56.000100 48213 local_connection.py:553] Error ${status}, Message: Bad Gateway: Failed to connect to backend API`;
+	const progressChunk: SessionNotification = {
+		sessionId: "s",
+		update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+	};
 
 	function tracker() {
 		vi.useFakeTimers();
 		const onFailure = vi.fn();
-		return { track: new ModelRetryTracker(onFailure), onFailure };
+		const watch = new PromptWatchdog(600_000, 3_600_000, (failure) => {
+			if (failure.kind === "retry") onFailure({ code: failure.code, message: failure.message });
+		});
+		watch.arm();
+		return {
+			track: {
+				noteStderrLine: (line: string) => watch.noteStderrLine(line),
+				noteProgress: () => watch.noteUpdate(progressChunk),
+				dispose: () => watch.dispose(),
+			},
+			onFailure,
+		};
 	}
 
 	it("tolerates two 429 retries and fails on the third", () => {
@@ -311,6 +328,45 @@ describe("ModelRetryTracker", () => {
 			code: "model",
 			message: "Antigravity model service temporarily unavailable (HTTP 502): Bad Gateway: Failed to connect to backend API; agy retried 2 times, next retry in 5s, without a reply.",
 		});
+		track.dispose();
+	});
+
+	it("includes bounded redacted latest 429 and proxy diagnostics when a quota retry window expires", () => {
+		vi.useFakeTimers();
+		const onFailure = vi.fn();
+		const watch = new PromptWatchdog(30_000, 3_600_000, onFailure);
+		watch.arm();
+		watch.noteStderrLine(exhausted);
+		watch.noteStderrLine(retry("4s"));
+		watch.noteStderrLine("W1122 21:29:00.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Upstream rate limiter closed socket");
+		watch.noteStderrLine(
+			"W1122 21:29:00.000200 48213 http_client.go:211] Error 429, Message: Per-minute limit reached for access_token=ya29.secret-quota-token-123456, Status: RESOURCE_EXHAUSTED",
+		);
+		vi.advanceTimersByTime(29_999);
+		expect(onFailure).not.toHaveBeenCalled();
+		vi.advanceTimersByTime(1);
+		expect(onFailure).toHaveBeenCalledTimes(1);
+		const failure = onFailure.mock.calls[0]![0] as { kind: string; code: string; message: string };
+		expect(failure.kind).toBe("retry");
+		expect(failure.code).toBe("quota");
+		expect(failure.message).toMatch(/^Antigravity quota exceeded:/u);
+		expect(failure.message).toContain("Per-minute limit reached for access_token=<redacted>");
+		expect(failure.message).toContain("Proxy failed to connect to CCPA API: Upstream rate limiter closed socket");
+		expect(failure.message).not.toContain("ya29.secret-quota-token-123456");
+		expect(isRetryableAssistantError({ stopReason: "error", errorMessage: failure.message } as never)).toBe(false);
+		watch.dispose();
+	});
+
+	it("scrubs non-retryable limit keywords from transient 5xx summaries so Pi outer retry remains enabled", () => {
+		const { track, onFailure } = tracker();
+		track.noteStderrLine("W1122 21:29:10.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: billing upstream unavailable");
+		track.noteStderrLine("W1122 21:29:10.000200 48213 local_connection.py:553] Error 502, Message: Bad Gateway: upstream quota exceeded cache miss");
+		track.noteStderrLine(retry("20s"));
+		expect(onFailure).toHaveBeenCalledTimes(1);
+		const failure = onFailure.mock.calls[0]![0] as { code: string; message: string };
+		expect(failure.code).toBe("model");
+		expect(failure.message).not.toMatch(/billing/iu);
+		expect(isRetryableAssistantError({ stopReason: "error", errorMessage: failure.message } as never)).toBe(true);
 		track.dispose();
 	});
 });

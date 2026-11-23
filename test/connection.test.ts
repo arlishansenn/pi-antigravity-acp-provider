@@ -1,5 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 
 import { AntigravityAcpConnection } from "../src/acp/connection.js";
@@ -513,12 +514,12 @@ describe("AntigravityAcpConnection", () => {
 			}
 		});
 
-		it("lets the accepted retry window outlive a shorter promptIdleTimeoutMs and preserves long structured ACP error tails", async () => {
+		it("caps the accepted retry window at a shorter promptIdleTimeoutMs while still surfacing the 502 model error and preserving long structured ACP error tails", async () => {
 			const connection = new AntigravityAcpConnection({
 				cwd: path.dirname(fakeAgent),
 				command: process.execPath,
 				args: [fakeAgent],
-				promptIdleTimeoutMs: 60_000,
+				promptIdleTimeoutMs: 30_000,
 			});
 			let promptId: string | number | undefined;
 			connection.process.onStderrLine((line) => {
@@ -533,22 +534,25 @@ describe("AntigravityAcpConnection", () => {
 				void pending.catch(() => undefined);
 				while (promptId === undefined) await new Promise((resolve) => setImmediate(resolve));
 
-				vi.advanceTimersByTime(10_000);
+				vi.advanceTimersByTime(5_000);
 				connection.process.child.stderr.push(
 					"I1122 21:28:15.000200 48213 local_connection.py:553] Error 502, Message: Bad Gateway: Failed to connect to backend API, Status: 502 Bad Gateway, Details: []\n" +
 					"I1122 21:28:15.000300 48213 planner_generator.go:359] Encountered retryable api error. retrying in 4s\n",
 				);
 				await new Promise((resolve) => setImmediate(resolve));
 
-				vi.advanceTimersByTime(120_000);
+				vi.advanceTimersByTime(20_000);
+				connection.process.child.stderr.push(
+					"W1122 21:28:35.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: Remote end closed connection without response\n",
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+				vi.advanceTimersByTime(9_999);
 				await new Promise((resolve) => setImmediate(resolve));
 				expect(settled).toBe(false);
 
-				connection.process.child.stderr.push(
-					"W1122 21:33:15.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Socket operation failed to CCPA API: Remote end closed connection without response\n",
-				);
+				vi.advanceTimersByTime(1);
 				await new Promise((resolve) => setImmediate(resolve));
-				vi.advanceTimersByTime(214_000);
+				expect(settled).toBe(true);
 				const error = await pending.catch((cause: unknown) => cause);
 				expect(error).toBeInstanceOf(AntigravityAcpError);
 				expect((error as AntigravityAcpError).code).toBe("model");
@@ -599,6 +603,63 @@ describe("AntigravityAcpConnection", () => {
 			}
 		});
 
+		it("protects busy tool and permission holds from stderr retry preemption and cleanly resumes idle tracking on release", async () => {
+			const connection = new AntigravityAcpConnection({
+				cwd: path.dirname(fakeAgent),
+				command: process.execPath,
+				args: [fakeAgent],
+				promptIdleTimeoutMs: 60_000,
+				promptWorkIdleTimeoutMs: 3_600_000,
+			});
+			let promptId: string | number | undefined;
+			connection.process.onStderrLine((line) => {
+				const match = /^hanging-prompt-id:(.+)$/u.exec(line);
+				if (match) promptId = Number.isNaN(Number(match[1])) ? match[1] : Number(match[1]);
+			});
+			try {
+				const session = await connection.newSession(process.cwd());
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+				let settled = false;
+				const pending = prompt(connection, session.sessionId, "hang-emit-id").finally(() => { settled = true; });
+				void pending.catch(() => undefined);
+				while (promptId === undefined) await new Promise((resolve) => setImmediate(resolve));
+
+				const releaseHold = connection.holdPromptWatchdog(session.sessionId);
+				connection.process.child.stdout.push(
+					`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: session.sessionId, update: { sessionUpdate: "tool_call", toolCallId: "native-1", title: "native", status: "in_progress" } } })}\n`,
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+
+				connection.process.child.stderr.push(
+					"W1114 22:07:04.512301 48213 http_client.go:211] Error 429, Message: Resource has been exhausted, Status: RESOURCE_EXHAUSTED\n" +
+					"I1114 22:07:04.512398 48213 planner_generator.go:359] Encountered retryable api error. retrying in 4s\n" +
+					"I1122 21:28:15.000200 48213 local_connection.py:553] Error 502, Message: Bad Gateway: Failed to connect to backend API, Status: 502 Bad Gateway, Details: []\n" +
+					"I1122 21:28:15.000300 48213 planner_generator.go:359] Encountered retryable api error. retrying in 20s\n",
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+
+				vi.advanceTimersByTime(500_000);
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(settled).toBe(false);
+
+				releaseHold();
+				connection.process.child.stdout.push(
+					`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: session.sessionId, update: { sessionUpdate: "tool_call_update", toolCallId: "native-1", status: "completed" } } })}\n`,
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(vi.getTimerCount()).toBe(1);
+
+				connection.process.child.stdout.push(
+					`${JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { sessionId: session.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "DONE" } } } })}\n` +
+					`${JSON.stringify({ jsonrpc: "2.0", id: promptId, result: { stopReason: "end_turn" } })}\n`,
+				);
+				expect((await pending).stopReason).toBe("end_turn");
+			} finally {
+				vi.useRealTimers();
+				await connection.close();
+			}
+		});
+
 		it("resets the transient retry count on streaming updates and permission requests", async () => {
 			const updates: string[] = [];
 			let permissions = 0;
@@ -614,6 +675,79 @@ describe("AntigravityAcpConnection", () => {
 				expect(permissions).toBe(1);
 				expect(updates).toEqual(["agent_thought_chunk", "agent_message_chunk", "agent_message_chunk"]);
 			} finally { await connection.close(); }
+		});
+
+		it("preserves latest redacted quota diagnostics on short-idle 429 expiry and keeps billing-worded 502 errors Pi-retryable", async () => {
+			const quotaConn = new AntigravityAcpConnection({
+				cwd: path.dirname(fakeAgent),
+				command: process.execPath,
+				args: [fakeAgent],
+				promptIdleTimeoutMs: 30_000,
+			});
+			let quotaPromptId: string | number | undefined;
+			quotaConn.process.onStderrLine((line) => {
+				const match = /^hanging-prompt-id:(.+)$/u.exec(line);
+				if (match) quotaPromptId = Number.isNaN(Number(match[1])) ? match[1] : Number(match[1]);
+			});
+			try {
+				const session = await quotaConn.newSession(process.cwd());
+				vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+				const pending = prompt(quotaConn, session.sessionId, "hang-emit-id");
+				void pending.catch(() => undefined);
+				while (quotaPromptId === undefined) await new Promise((resolve) => setImmediate(resolve));
+				quotaConn.process.child.stderr.push(
+					"W1114 22:07:04.512301 48213 http_client.go:211] Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED\n" +
+					"I1114 22:07:04.512398 48213 planner_generator.go:359] Encountered retryable api error. retrying in 4s\n" +
+					"W1114 22:07:10.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: Upstream throttle drop\n" +
+					"W1114 22:07:10.000200 48213 http_client.go:211] Error 429, Message: Per-minute token limit for api_key=AIzaSecretKey1234567890, Status: RESOURCE_EXHAUSTED\n",
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+				vi.advanceTimersByTime(30_000);
+				const quotaErr = await pending.catch((cause: unknown) => cause);
+				expect(quotaErr).toBeInstanceOf(AntigravityAcpError);
+				expect((quotaErr as AntigravityAcpError).code).toBe("quota");
+				const formattedQuota = errorMessage(quotaErr);
+				expect(formattedQuota).toMatch(/^Antigravity quota exceeded:/u);
+				expect(formattedQuota).toContain("Per-minute token limit for api_key=<redacted>");
+				expect(formattedQuota).toContain("Proxy failed to connect to CCPA API: Upstream throttle drop");
+				expect(formattedQuota).not.toContain("AIzaSecretKey1234567890");
+				expect(isRetryableAssistantError({ stopReason: "error", errorMessage: formattedQuota } as never)).toBe(false);
+			} finally {
+				vi.useRealTimers();
+				await quotaConn.close();
+			}
+
+			const modelConn = new AntigravityAcpConnection({
+				cwd: path.dirname(fakeAgent),
+				command: process.execPath,
+				args: [fakeAgent],
+				promptIdleTimeoutMs: 30_000,
+			});
+			let modelPromptId: string | number | undefined;
+			modelConn.process.onStderrLine((line) => {
+				const match = /^hanging-prompt-id:(.+)$/u.exec(line);
+				if (match) modelPromptId = Number.isNaN(Number(match[1])) ? match[1] : Number(match[1]);
+			});
+			try {
+				const session = await modelConn.newSession(process.cwd());
+				const pending = prompt(modelConn, session.sessionId, "hang-emit-id");
+				void pending.catch(() => undefined);
+				while (modelPromptId === undefined) await new Promise((resolve) => setImmediate(resolve));
+				modelConn.process.child.stderr.push(
+					"W1122 21:29:10.000100 48213 proxy_server.py:222] Proxy failed to connect to CCPA API: billing gateway reset\n" +
+					"W1122 21:29:10.000200 48213 local_connection.py:553] Error 502, Message: Bad Gateway: upstream quota exceeded cache miss, Status: 502 Bad Gateway\n" +
+					"I1122 21:29:10.000300 48213 planner_generator.go:359] Encountered retryable api error. retrying in 20s\n",
+				);
+				const modelErr = await pending.catch((cause: unknown) => cause);
+				expect(modelErr).toBeInstanceOf(AntigravityAcpError);
+				expect((modelErr as AntigravityAcpError).code).toBe("model");
+				const formattedModel = errorMessage(modelErr);
+				expect(formattedModel).toContain("Antigravity model service temporarily unavailable (HTTP 502):");
+				expect(formattedModel).not.toMatch(/billing|quota exceeded/iu);
+				expect(isRetryableAssistantError({ stopReason: "error", errorMessage: formattedModel } as never)).toBe(true);
+			} finally {
+				await modelConn.close();
+			}
 		});
 	});
 

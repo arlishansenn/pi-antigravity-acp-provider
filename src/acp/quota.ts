@@ -1,3 +1,5 @@
+import { redactBounded } from "./errors.js";
+
 const UNIT_MS: Record<string, number> = { day: 86_400_000, hour: 3_600_000, minute: 60_000, second: 1_000 };
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 // agy replies with this fixed notice, without usage, when the account's quota is exhausted.
@@ -24,9 +26,7 @@ export function quotaExhaustion(text: string, now = Date.now()): { resetAt?: str
 export const RESOURCE_EXHAUSTED_MAX_RETRIES = 2;
 export const TRANSIENT_MODEL_MAX_RETRIES = 1;
 export const MODEL_RETRY_DELAY_BUDGET_MS = 15_000;
-/** After a retry, agy logs nothing more if the call succeeds, so silence alone cannot tell recovery from a hang. */
 export const MODEL_RETRY_STARTUP_MARGIN_MS = 30_000;
-/** Covers agy's internal 300 s CCPA proxy read timeout plus connection and streaming startup margin on the single 5xx retry. */
 export const TRANSIENT_MODEL_RETRY_WINDOW_MS = 330_000;
 export const MODEL_RETRY_UNPARSED_DELAY_MS = 10_000;
 
@@ -45,7 +45,7 @@ const RETRY = /\bEncountered retryable api error\. retrying in\b(?: ((?:\d+(?:\.
 const DURATION_MS: Record<string, number> = { h: 3_600_000, m: 60_000, s: 1_000, ms: 1, us: 1e-3, "µs": 1e-3, ns: 1e-6 };
 
 type PendingRetryError =
-	| { kind: "quota" }
+	| { kind: "quota"; apiMessage?: string; proxyDetail?: string }
 	| { kind: "transient"; status: number; apiMessage?: string; proxyDetail?: string };
 
 export interface RetryExhaustionFailure {
@@ -53,16 +53,30 @@ export interface RetryExhaustionFailure {
 	message: string;
 }
 
+export type RetryStepResult =
+	| { kind: "none" }
+	| { kind: "accepted"; windowMs: number }
+	| { kind: "exhausted"; failure: RetryExhaustionFailure };
+
+const GENERIC_QUOTA_MESSAGE = /^resource (?:has been )?exhausted(?:\s*\(e\.g\.\s*check quota\)\.?)?\.?$/iu;
+const NON_RETRYABLE_PROVIDER_KEYWORDS =
+	/GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|subscription_sharing_usage_limit_exceeded|subscription_sharing_workplace_individual_usage_limit_exceeded|"code"\s*:\s*"?1308(?![0-9])/giu;
+
+export function scrubNonRetryableKeywords(text: string): string {
+	return text.replace(NON_RETRYABLE_PROVIDER_KEYWORDS, "<redacted>");
+}
+
+export function isGenericQuotaDiagnostic(text: string): boolean {
+	const match = /^Error 429,\s*Message:\s*(.+)$/iu.exec(text.trim());
+	return match ? GENERIC_QUOTA_MESSAGE.test(match[1]!.trim()) : GENERIC_QUOTA_MESSAGE.test(text.trim());
+}
+
 function isTransientModelStatus(status: number): boolean {
 	return status === 408 || (status >= 500 && status <= 599);
 }
 
 function compactDiagnostic(text: string, limit = 512): string {
-	const trimmed = text.trim();
-	if (trimmed.length <= limit) return trimmed;
-	const head = 192;
-	const marker = " ... ";
-	return `${trimmed.slice(0, head)}${marker}${trimmed.slice(-(limit - head - marker.length))}`;
+	return redactBounded(text.trim(), limit, 192);
 }
 
 function cleanApiMessage(raw: string): string {
@@ -71,6 +85,11 @@ function cleanApiMessage(raw: string): string {
 			.replace(/,\s*Status:\s*[^\r\n]*$/u, "")
 			.replace(/,\s*Details:\s*\[[^\r\n]*$/u, ""),
 	);
+}
+
+function cleanQuotaMessage(raw: string): string | undefined {
+	const cleaned = cleanApiMessage(raw);
+	return cleaned && !GENERIC_QUOTA_MESSAGE.test(cleaned) ? cleaned : undefined;
 }
 
 function joinDiagnosticParts(primary?: string, secondary?: string): string | undefined {
@@ -116,7 +135,7 @@ export class StderrDiagnosticTracker {
 	}
 }
 
-export class ModelRetryTracker {
+export class ModelRetryState {
 	private pending: PendingRetryError | undefined;
 	private pendingProxyDetail: string | undefined;
 	private lastError: PendingRetryError | undefined;
@@ -124,24 +143,16 @@ export class ModelRetryTracker {
 	private retries = 0;
 	private nextDelayMs: number | undefined;
 	private waitedMs = 0;
-	private timer: ReturnType<typeof setTimeout> | undefined;
-	private done = false;
-
-	constructor(
-		private readonly onFailure: (failure: RetryExhaustionFailure) => void,
-		private readonly onRetry?: () => void,
-	) {}
 
 	get diagnosticParts(): readonly string[] {
 		return this.diagnostics.parts;
 	}
 
-	get diagnostic(): string | undefined {
-		return this.diagnostics.summary;
+	noteDiagnosticOnly(line: string): void {
+		this.diagnostics.noteStderrLine(line);
 	}
 
-	noteStderrLine(line: string): void {
-		if (this.done) return;
+	noteStderrLine(line: string): RetryStepResult {
 		this.diagnostics.noteStderrLine(line);
 		const proxyMatch = PROXY_ERROR.exec(line);
 		if (proxyMatch) {
@@ -151,8 +162,12 @@ export class ModelRetryTracker {
 		if (apiError) {
 			const status = Number(apiError[1]);
 			if (EXHAUSTED.test(line)) {
-				this.pending = { kind: "quota" };
-				this.pendingProxyDetail = undefined;
+				const apiMessage = cleanQuotaMessage(apiError[2]!);
+				this.pending = {
+					kind: "quota",
+					...(apiMessage ? { apiMessage } : {}),
+					...(this.pendingProxyDetail ? { proxyDetail: this.pendingProxyDetail } : {}),
+				};
 			} else if (isTransientModelStatus(status)) {
 				const apiMessage = cleanApiMessage(apiError[2]!);
 				this.pending = {
@@ -181,7 +196,7 @@ export class ModelRetryTracker {
 			}
 		}
 		const retry = RETRY.exec(line);
-		if (!retry || !this.pending) return;
+		if (!retry || !this.pending) return { kind: "none" };
 		const current = this.pending;
 		this.lastError = current;
 		this.pending = undefined;
@@ -198,78 +213,63 @@ export class ModelRetryTracker {
 		this.waitedMs += delayMs;
 		const policy = RETRY_POLICIES[current.kind];
 		if (this.retries > policy.maxRetries || this.waitedMs > MODEL_RETRY_DELAY_BUDGET_MS) {
-			this.fire();
-			return;
+			return { kind: "exhausted", failure: this.buildFailure() };
 		}
-		this.onRetry?.();
-		this.clearTimer();
-		this.timer = setTimeout(() => this.fire(), delayMs + policy.windowMs);
-		this.timer.unref?.();
+		return { kind: "accepted", windowMs: delayMs + policy.windowMs };
 	}
 
-	noteProgress(): void {
-		if (this.done) return;
+	reset(): void {
 		this.pending = undefined;
 		this.pendingProxyDetail = undefined;
 		this.lastError = undefined;
 		this.diagnostics.reset();
 		this.retries = 0;
+		this.nextDelayMs = undefined;
 		this.waitedMs = 0;
-		this.clearTimer();
 	}
 
-	dispose(): void {
-		this.done = true;
-		this.clearTimer();
-	}
-
-	private fire(): void {
+	buildFailure(): RetryExhaustionFailure {
 		const failure = this.latestFailure();
-		this.dispose();
 		const times = this.retries === 1 ? "time" : "times";
 		const next = this.nextDelayMs === undefined ? "next retry delay unknown"
 			: `next retry in ${Number((this.nextDelayMs / 1_000).toFixed(2))}s`;
 		if (failure?.kind === "transient") {
-			const detail = joinDiagnosticParts(failure.apiMessage, failure.proxyDetail);
+			const rawDetail = joinDiagnosticParts(failure.apiMessage, failure.proxyDetail);
+			const detail = rawDetail ? scrubNonRetryableKeywords(rawDetail) : undefined;
 			const detailSuffix = detail ? `: ${detail};` : ":";
-			this.onFailure({
+			return {
 				code: "model",
 				message:
 					`Antigravity model service temporarily unavailable (HTTP ${failure.status})${detailSuffix} ` +
 					`agy retried ${this.retries} ${times}, ${next}, without a reply.`,
-			});
-			return;
+			};
 		}
+		const quotaDetail = joinDiagnosticParts(failure?.apiMessage, failure?.proxyDetail);
+		const quotaSuffix = quotaDetail ? `: ${quotaDetail};` : ";";
 		// "quota exceeded" makes Pi's isRetryableAssistantError return false despite "429" and "rate limit".
-		this.onFailure({
+		return {
 			code: "quota",
 			message:
-				"Antigravity quota exceeded: the model path refused requests with HTTP 429 RESOURCE_EXHAUSTED (rate limit or entitlement); " +
+				`Antigravity quota exceeded: the model path refused requests with HTTP 429 RESOURCE_EXHAUSTED (rate limit or entitlement)${quotaSuffix} ` +
 				`agy retried ${this.retries} ${times}, ${next}, without a reply. ` +
 				"Retry later or switch to another provider.",
-		});
+		};
 	}
 
 	private latestFailure(): PendingRetryError | undefined {
 		if (this.pending) {
-			if (this.pending.kind === "transient" && this.lastError?.kind === "transient") {
-				return {
-					...this.pending,
-					...(this.pending.proxyDetail ?? this.lastError.proxyDetail
-						? { proxyDetail: this.pending.proxyDetail ?? this.lastError.proxyDetail }
-						: {}),
-				};
-			}
-			return this.pending;
+			const sameKind = this.lastError?.kind === this.pending.kind ? this.lastError : undefined;
+			const apiMessage = this.pending.apiMessage ?? sameKind?.apiMessage;
+			const proxyDetail = this.pending.proxyDetail ?? this.pendingProxyDetail ?? sameKind?.proxyDetail;
+			return {
+				...this.pending,
+				...(apiMessage ? { apiMessage } : {}),
+				...(proxyDetail ? { proxyDetail } : {}),
+			};
 		}
-		if (this.lastError?.kind === "transient" && this.pendingProxyDetail) {
+		if (this.lastError && this.pendingProxyDetail) {
 			return { ...this.lastError, proxyDetail: this.pendingProxyDetail };
 		}
 		return this.lastError;
-	}
-
-	private clearTimer(): void {
-		if (this.timer) clearTimeout(this.timer);
-		this.timer = undefined;
 	}
 }
