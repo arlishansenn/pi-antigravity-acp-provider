@@ -105,6 +105,39 @@ describe("mid-turn steer arriving in the same continuation as tool or permission
 		expect(acpPrompts()).toHaveLength(2);
 		expect(acpPrompts()[1]).toContain(STEER);
 		expect(acpPrompts()[1]).toContain("next turn");
+		expect(acpPrompts()[1]).not.toContain(acpEcho(continued));
 		expect(acpLedger("steer-perm")).toBe(SYSTEM_HEAD + [...beforeSteer, steer, continued, user("next turn", 5)].length);
+	});
+
+	it("delivers each result once across two sequential tool calls in one turn", async () => {
+		const { runtime } = setup();
+		const options = { sessionId: "steer-seq", apiKey: "test-key" };
+		const request = user("use bridge sequential", 1);
+		const first = await drain(runtime.stream(model, { tools, messages: [request] }, options));
+		expect(first.stopReason).toBe("toolUse");
+		const firstResult = result(calls(first)[0]!, "echo-0", 2);
+		const second = await drain(runtime.stream(model, { tools, messages: [request, first, firstResult] }, options));
+		expect(second.stopReason).toBe("toolUse");
+		const secondResult = result(calls(second)[0]!, "echo-1", 3);
+		const final = await drain(runtime.stream(model, { tools, messages: [request, first, firstResult, second, secondResult] }, options));
+		expect(final.stopReason).toBe("stop");
+		expect(acpEcho(final)).toBe("echo-0||echo-1");
+	});
+
+	it("delivers a steer that rides the first of two sequential results once", async () => {
+		const { runtime } = setup();
+		const options = { sessionId: "steer-seq-steer", apiKey: "test-key" };
+		const request = user("use bridge sequential", 1);
+		const first = await drain(runtime.stream(model, { tools, messages: [request] }, options));
+		const firstResult = result(calls(first)[0]!, "echo-0", 2);
+		const steer = user(STEER, 3);
+		const second = await drain(runtime.stream(model, { tools, messages: [request, first, firstResult, steer] }, options));
+		expect(second.stopReason).toBe("toolUse");
+		const secondResult = result(calls(second)[0]!, "echo-1", 4);
+		const final = await drain(runtime.stream(model, { tools, messages: [request, first, firstResult, steer, second, secondResult] }, options));
+		expect(final.stopReason).toBe("stop");
+		const [firstEcho, secondEcho] = acpEcho(final).split("||");
+		expect(firstEcho?.split(STEER)).toHaveLength(2);
+		expect(secondEcho).toBe("echo-1");
 	});
 });

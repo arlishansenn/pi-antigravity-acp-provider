@@ -290,6 +290,16 @@ for await (const line of rl) {
 			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
 			continue;
 		}
+		if (!continuing && text.includes("bridge sequential") && mcpServer) {
+			// Two pi-bridge calls in one turn; the second starts only after the first result returns.
+			void (async () => {
+				const first = await invokeMcpTool(mcpServer, "first");
+				const second = await invokeMcpTool(mcpServer, "second");
+				notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${first}||${second}` } });
+				send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			})().catch(() => undefined);
+			continue;
+		}
 		if (!continuing && text.includes("bridge and permission") && mcpServer) {
 			// Like agy in default mode: one inference starts a pi-bridge call, then asks to run a
 			// native action before that call returns. Both answers are needed to finish the prompt.
