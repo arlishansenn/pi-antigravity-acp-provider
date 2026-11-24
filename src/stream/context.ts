@@ -247,6 +247,10 @@ function findLatestUserIndex(messages: Message[]): number {
 	return -1;
 }
 
+export function renderHistoryMessage(message: Message): string {
+	return formatMessage(message).map((entry) => renderEntry(entry)).join(ENTRY_SEPARATOR);
+}
+
 function formatMessage(message: Message): HistoryEntry[] {
 	// System content/sections are replayed separately as trusted instructions.
 	if (message.role === "system") return [];
