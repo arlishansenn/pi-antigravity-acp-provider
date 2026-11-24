@@ -180,7 +180,7 @@ describe("bounded context reconstruction", () => {
 		] };
 		const { prompt } = buildPromptParts(context, false, 1, [steer]);
 		const held = resourceText(prompt[0]);
-		expect(held).toContain("# Pi user messages received during the previous Antigravity turn");
+		expect(held).toContain("# Pi messages received during the previous Antigravity turn");
 		expect(held).toContain("HELD_HEAD");
 		expect(held).toContain("HELD_TAIL");
 		const delta = resourceText(prompt[1]);

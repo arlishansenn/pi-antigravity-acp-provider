@@ -17,7 +17,7 @@ Preconditions: none for the protocol-level recipe.
 
 - Protocol-level only:
   - `npx vitest run test/steer-continuation.test.ts test/late-tool-result.test.ts`
-  - Observable result: passed. The permission case in `steer-continuation.test.ts` asserts the ledger stops before the steer.
+  - Observable result: passed. The permission cases in `steer-continuation.test.ts` assert that a steer held back behind one or two permission answers reaches the next prompt once.
 
 ## Gotchas
 

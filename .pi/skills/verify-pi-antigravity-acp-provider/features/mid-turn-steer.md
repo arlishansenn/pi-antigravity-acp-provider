@@ -6,7 +6,7 @@ A message Pi appends with `deliverAs: "steer"` while the model's turn is still o
 
 - `steer-tool`: steer appended after a Pi tool result. The model sees it with the tool result in the same turn.
 - `steer-parallel`: steer appended after several parallel tool results. Attached once, to the last result.
-- `steer-permission`: steer appended after a permission answer. Held out of the ledger; the next prompt carries it as the current request.
+- `steer-permission`: steer appended after a permission answer. A permission answer carries no content, so the provider records the steer as held back and the next prompt carries it in its own section, once.
 
 ## How to get to it (user POV)
 
@@ -26,7 +26,7 @@ Preconditions: `verify.sh doctor` passes; the account is logged in to the runtim
   - Observable result on a build without the fix: `FAIL steer-tool: reply lacks steer token ...` and `pi-final-reply.txt` reads `NO_STEER`.
 - Cover the permission path at protocol level:
   - `npx vitest run test/steer-continuation.test.ts`
-  - Observable result: 4 passed. The permission case asserts the ledger stops before the steer and the next prompt carries it.
+  - Observable result: all pass. The permission cases assert that the next prompt carries the steer once and nothing the model already saw.
 
 ## Gotchas
 
