@@ -42,7 +42,8 @@ function setup() {
 		.filter((entry) => entry.method === "session/prompt")
 		.map((entry) => (entry.prompt ?? []).map((block) => block.type === "text" ? block.text ?? "" : block.resource?.text ?? "").join("\n"));
 	const acpLedger = (sessionId: string) => store.get(sessionId)?.messageCount;
-	return { runtime, acpPrompts, acpLedger };
+	const acpNewSessions = () => fs.readFileSync(log, "utf8").split("\n").filter((line) => line.includes('"method":"session/new"')).length;
+	return { runtime, acpPrompts, acpLedger, acpNewSessions };
 }
 async function drain(writer: PiEventWriter) { for await (const _event of writer.stream) void _event; return writer.message; }
 const user = (content: string, timestamp: number): Context["messages"][number] => ({ role: "user", content, timestamp });
@@ -85,7 +86,7 @@ describe("mid-turn steer arriving in the same continuation as tool or permission
 		expect(acpPrompts()[1]).not.toContain(STEER);
 	});
 
-	it("keeps a steer that rides with a permission-only answer out of the ledger until the next prompt delivers it", async () => {
+	it("holds a steer that rides with a permission-only answer for the next prompt and delivers it once", async () => {
 		const { runtime, acpPrompts, acpLedger } = setup();
 		const options = { sessionId: "steer-perm", apiKey: "test-key" };
 		const first = await drain(runtime.stream(model, { tools, messages: [user("use permission", 1)] }, options));
@@ -98,15 +99,19 @@ describe("mid-turn steer arriving in the same continuation as tool or permission
 		const continued = await drain(runtime.stream(model, { tools, messages: [...beforeSteer, steer] }, options));
 		expect(continued.stopReason).toBe("stop");
 		expect(acpEcho(continued)).toContain("Decision: selected");
-		expect(acpLedger("steer-perm")).toBe(SYSTEM_HEAD + beforeSteer.length);
+		expect(acpLedger("steer-perm")).toBe(SYSTEM_HEAD + [...beforeSteer, steer].length);
 
 		const next = await drain(runtime.stream(model, { tools, messages: [...beforeSteer, steer, continued, user("next turn", 5)] }, options));
 		expect(next.stopReason).toBe("stop");
 		expect(acpPrompts()).toHaveLength(2);
-		expect(acpPrompts()[1]).toContain(STEER);
+		expect(acpPrompts()[1]?.split(STEER)).toHaveLength(2);
 		expect(acpPrompts()[1]).toContain("next turn");
 		expect(acpPrompts()[1]).not.toContain(acpEcho(continued));
-		expect(acpLedger("steer-perm")).toBe(SYSTEM_HEAD + [...beforeSteer, steer, continued, user("next turn", 5)].length);
+
+		const later = await drain(runtime.stream(model, { tools, messages: [...beforeSteer, steer, continued, user("next turn", 5), next, user("later", 6)] }, options));
+		expect(later.stopReason).toBe("stop");
+		expect(acpPrompts()[2]).toContain("later");
+		expect(acpPrompts()[2]).not.toContain(STEER);
 	});
 
 	it("delivers each result once across two sequential tool calls in one turn", async () => {
@@ -139,5 +144,96 @@ describe("mid-turn steer arriving in the same continuation as tool or permission
 		const [firstEcho, secondEcho] = acpEcho(final).split("||");
 		expect(firstEcho?.split(STEER)).toHaveLength(2);
 		expect(secondEcho).toBe("echo-1");
+	});
+
+	it("delivers a steer held back behind two permission answers once, without the model's own turn", async () => {
+		const { runtime, acpPrompts } = setup();
+		const options = { sessionId: "steer-perm-chain", apiKey: "test-key" };
+		const request = user("permission chain", 1);
+		const first = await drain(runtime.stream(model, { tools, messages: [request] }, options));
+		const firstPermission = calls(first).find((call) => call.name === PERMISSION_TOOL_NAME)!;
+		const steer = user(STEER, 3);
+		const second = await drain(runtime.stream(model, { tools, messages: [request, first, allow(firstPermission), steer] }, options));
+		expect(acpEcho(second)).toBe("P1:selected");
+		expect(second.stopReason).toBe("toolUse");
+		const secondPermission = calls(second).find((call) => call.name === PERMISSION_TOOL_NAME)!;
+		const third = await drain(runtime.stream(model, { tools, messages: [request, first, allow(firstPermission), steer, second, allow(secondPermission)] }, options));
+		expect(acpEcho(third)).toBe("P2:selected");
+		expect(third.stopReason).toBe("stop");
+
+		const next = await drain(runtime.stream(model, { tools, messages: [request, first, allow(firstPermission), steer, second, allow(secondPermission), third, user("next turn", 5)] }, options));
+		expect(next.stopReason).toBe("stop");
+		expect(acpPrompts()).toHaveLength(2);
+		expect(acpPrompts()[1]?.split(STEER)).toHaveLength(2);
+		expect(acpPrompts()[1]).toContain("next turn");
+		for (const own of ["P1:selected", "P2:selected", "Allowed"]) expect(acpPrompts()[1]).not.toContain(own);
+	});
+
+	it("delivers a steer held back behind two permission answers with the next tool result, once", async () => {
+		const { runtime } = setup();
+		const options = { sessionId: "steer-perm-chain-tool", apiKey: "test-key" };
+		const request = user("permission chain then tool", 1);
+		const first = await drain(runtime.stream(model, { tools, messages: [request] }, options));
+		const firstPermission = calls(first).find((call) => call.name === PERMISSION_TOOL_NAME)!;
+		const steer = user(STEER, 3);
+		const second = await drain(runtime.stream(model, { tools, messages: [request, first, allow(firstPermission), steer] }, options));
+		const secondPermission = calls(second).find((call) => call.name === PERMISSION_TOOL_NAME)!;
+		const third = await drain(runtime.stream(model, { tools, messages: [request, first, allow(firstPermission), steer, second, allow(secondPermission)] }, options));
+		expect(third.stopReason).toBe("toolUse");
+		const echo = calls(third).find((call) => call.name === "echo")!;
+		const final = await drain(runtime.stream(model, { tools, messages: [request, first, allow(firstPermission), steer, second, allow(secondPermission), third, result(echo, "chain-out", 5)] }, options));
+		expect(final.stopReason).toBe("stop");
+		expect(acpEcho(final).split(STEER)).toHaveLength(2);
+		expect(acpEcho(final)).toContain("Pi delivered 1 message(s)");
+		expect(acpEcho(final)).not.toContain("Allowed");
+	});
+
+	it("attaches nothing when Pi changed the delivered prefix during the tool call, and rebuilds on the next prompt", async () => {
+		const { runtime, acpPrompts, acpNewSessions } = setup();
+		const options = { sessionId: "steer-prefix", apiKey: "test-key" };
+		const request = user("use bridge", 1);
+		const first = await drain(runtime.stream(model, { tools, messages: [request] }, options));
+		const echo = calls(first).find((call) => call.name === "echo")!;
+		const steer = user(STEER, 3);
+		const continued = await drain(runtime.stream(model, { tools, messages: [user("inserted later", 0), request, first, result(echo, "echo-0", 2), steer] }, options));
+		expect(continued.stopReason).toBe("stop");
+		expect(acpEcho(continued)).toBe("echo-0");
+
+		const next = await drain(runtime.stream(model, { tools, messages: [user("inserted later", 0), request, first, result(echo, "echo-0", 2), steer, continued, user("next turn", 4)] }, options));
+		expect(next.stopReason).toBe("stop");
+		expect(acpNewSessions()).toBe(2);
+		expect(acpPrompts()[1]).toContain("# Prior conversation");
+		expect(acpPrompts()[1]).toContain(STEER);
+	});
+
+	it("sends a held-back steer once when Pi retries without a new user message", async () => {
+		const { runtime, acpPrompts } = setup();
+		const options = { sessionId: "steer-retry", apiKey: "test-key" };
+		const first = await drain(runtime.stream(model, { tools, messages: [user("use permission", 1)] }, options));
+		const permission = calls(first).find((call) => call.name === PERMISSION_TOOL_NAME)!;
+		const beforeSteer = [user("use permission", 1), first, allow(permission)];
+		const steer = user(STEER, 4);
+		const continued = await drain(runtime.stream(model, { tools, messages: [...beforeSteer, steer] }, options));
+		expect(continued.stopReason).toBe("stop");
+		const retry = await drain(runtime.stream(model, { tools, messages: [...beforeSteer, steer] }, options));
+		expect(retry.stopReason).toBe("stop");
+		expect(acpPrompts()).toHaveLength(2);
+		expect(acpPrompts()[1]?.split(STEER)).toHaveLength(2);
+	});
+
+	it("sends a held-back steer once on retry even when an earlier user message has the same text", async () => {
+		const { runtime, acpPrompts } = setup();
+		const options = { sessionId: "steer-retry-duplicate", apiKey: "test-key" };
+		const earlier = user("SAME_TEXT", 0);
+		const request = user("use permission", 1);
+		const first = await drain(runtime.stream(model, { tools, messages: [earlier, request] }, options));
+		const permission = calls(first).find((call) => call.name === PERMISSION_TOOL_NAME)!;
+		const beforeSteer = [earlier, request, first, allow(permission)];
+		const steer = user("SAME_TEXT", 4);
+		const continued = await drain(runtime.stream(model, { tools, messages: [...beforeSteer, steer] }, options));
+		expect(continued.stopReason).toBe("stop");
+		const retry = await drain(runtime.stream(model, { tools, messages: [...beforeSteer, steer] }, options));
+		expect(retry.stopReason).toBe("stop");
+		expect(acpPrompts()[1]?.split("SAME_TEXT")).toHaveLength(2);
 	});
 });
