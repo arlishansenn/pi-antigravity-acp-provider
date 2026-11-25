@@ -1,4 +1,5 @@
 import { redactBounded } from "./errors.js";
+import { classifyFailure } from "./failure-classes.js";
 
 const UNIT_MS: Record<string, number> = { day: 86_400_000, hour: 3_600_000, minute: 60_000, second: 1_000 };
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -237,11 +238,12 @@ export class ModelRetryState {
 			const rawDetail = joinDiagnosticParts(failure.apiMessage, failure.proxyDetail);
 			const detail = rawDetail ? scrubNonRetryableKeywords(rawDetail) : undefined;
 			const detailSuffix = detail ? `: ${detail};` : ":";
+			const hint = detail ? classifyFailure(detail)?.hint : undefined;
 			return {
 				code: "model",
 				message:
 					`Antigravity model service temporarily unavailable (HTTP ${failure.status})${detailSuffix} ` +
-					`agy retried ${this.retries} ${times}, ${next}, without a reply.`,
+					`agy retried ${this.retries} ${times}, ${next}, without a reply.${hint ? ` ${hint}` : ""}`,
 			};
 		}
 		const quotaDetail = joinDiagnosticParts(failure?.apiMessage, failure?.proxyDetail);

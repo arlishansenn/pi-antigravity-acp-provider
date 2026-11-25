@@ -58,6 +58,7 @@ Kills only the Pi PID recorded in `pids` (and its children) if it is still alive
 - `bin/verify.sh`: doctor, steer-tool, cleanup, all.
 - `bin/steer-extension.ts`: Pi extension that registers `verify_hold_and_steer`. Loaded with `-e`; never installed.
 - `bin/final-reply.mjs <pi-events.jsonl>`: prints the final assistant text from a print-mode event stream.
+- `bin/fault-proxy.mjs` and `bin/fault-run.sh <pass|stall|swallow|close> <host-regex> <port>`: inject a fault on one upstream host in front of the real runtime. See [features/upstream-failures.md](features/upstream-failures.md).
 
 ## Gotchas
 

@@ -134,6 +134,10 @@ for await (const line of rl) {
 		send({ jsonrpc: "2.0", id, result: {} });
 	} else if (method === "session/new") {
 		if (scenario === "session-timeout") continue;
+		if (scenario === "session-login-required") {
+			process.stderr.write("https://accounts.google.com/o/oauth2/v2/auth?client_id=fake&state=fake\n");
+			continue;
+		}
 		if (scenario === "internal-error") {
 			send({
 				jsonrpc: "2.0",
