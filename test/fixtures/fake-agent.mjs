@@ -26,6 +26,7 @@ let mcpServer;
 let resumeAfterPermission;
 // Set while a bridge call and a permission request from the same inference are both outstanding.
 let resolveMixedPermission;
+const permissionAnswers = new Map();
 
 for await (const line of rl) {
 	if (!line.trim()) continue;
@@ -48,7 +49,10 @@ for await (const line of rl) {
 	const { id, method, params } = message;
 	if (process.env.FAKE_AGENT_LOG_FILE && method) fs.appendFileSync(process.env.FAKE_AGENT_LOG_FILE,
 		JSON.stringify({ method, ...(method === "initialize" ? { params } : {}), ...(method === "session/prompt" ? { prompt: params.prompt, mode } : {}), ...(method === "session/set_mode" ? { modeId: params.modeId } : {}) }) + "\n");
-	if (id === "mixed-permission" && method === undefined) {
+	if (method === undefined && permissionAnswers.has(id)) {
+		permissionAnswers.get(id)(message.result?.outcome?.outcome ?? "cancelled");
+		permissionAnswers.delete(id);
+	} else if (id === "mixed-permission" && method === undefined) {
 		resolveMixedPermission?.(message.result?.outcome?.optionId ?? message.result?.outcome?.outcome ?? "cancelled");
 		resolveMixedPermission = undefined;
 	} else if (id === "exhausted-permission" && method === undefined) {
@@ -288,6 +292,27 @@ for await (const line of rl) {
 			});
 			notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done" } });
 			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			continue;
+		}
+		if (!continuing && text.includes("permission chain") && mcpServer) {
+			void (async () => {
+				const first = await askPermission(params.sessionId, 1);
+				notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `P1:${first}` } });
+				const second = await askPermission(params.sessionId, 2);
+				let tail = `P2:${second}`;
+				if (text.includes("then tool")) tail += `|T:${await invokeMcpTool(mcpServer, "chain")}`;
+				notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: tail } });
+				send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			})().catch(() => undefined);
+			continue;
+		}
+		if (!continuing && text.includes("bridge sequential") && mcpServer) {
+			void (async () => {
+				const first = await invokeMcpTool(mcpServer, "first");
+				const second = await invokeMcpTool(mcpServer, "second");
+				notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${first}||${second}` } });
+				send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			})().catch(() => undefined);
 			continue;
 		}
 		if (!continuing && text.includes("bridge and permission") && mcpServer) {
@@ -532,6 +557,16 @@ for await (const line of rl) {
 	} else {
 		send({ jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown method ${method}` } });
 	}
+}
+
+function askPermission(sessionId, n) {
+	return new Promise((resolve) => {
+		const id = `chain-permission-${n}`;
+		permissionAnswers.set(id, resolve);
+		send({ jsonrpc: "2.0", id, method: "session/request_permission", params: { sessionId,
+			toolCall: { toolCallId: `native-chain-${n}`, title: "Run native command", kind: "execute" },
+			options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }, { optionId: "reject-once", name: "Reject", kind: "reject_once" }] } });
+	});
 }
 
 function finishBeforePiResult(id) {

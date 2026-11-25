@@ -50,7 +50,7 @@ import {
 } from "./mcp/bridge.js";
 import type { PermissionMode, ToolActivityMode } from "./config.js";
 import { resolveAcpModelId } from "./models.js";
-import { type PromptParts, buildPromptParts, currentSystemInstructions } from "./stream/context.js";
+import { type PromptParts, buildPromptParts, currentSystemInstructions, renderHistoryMessage } from "./stream/context.js";
 import { PiEventWriter } from "./stream/pi-events.js";
 import { usageFromPrompt } from "./stream/usage.js";
 import { RuntimeMetrics } from "./status.js";
@@ -88,8 +88,10 @@ interface Binding {
 	messageCount: number;
 	historyFingerprint: string;
 	expectedAssistantFingerprint: string | undefined;
-	pendingContextCount: number;
-	pendingContextFingerprint: string;
+	heldBack: string[];
+	deliveredCount: number;
+	deliveredFingerprint: string;
+	deliveredHeldBack: string[];
 	writer: PiEventWriter | undefined;
 	permission: PendingPermission | undefined;
 	pendingTools: Map<string, PendingPiTool>;
@@ -582,12 +584,12 @@ export class AntigravityRuntime {
 			}
 			if (binding.permission || binding.pendingTools.size > 0) {
 				const permission = binding.permission;
-				const permissionResult = permission ? findPermissionResult(context, permission.id) : undefined;
+				const permissionMatch = permission ? findPermissionResult(context, permission.id) : undefined;
 				const results = [...binding.pendingTools.values()].map((pending) => ({
 					pending,
 					message: findToolResult(context, pending.invocation.id, pending.invocation.name),
 				}));
-				if ((permission && !permissionResult) || results.some((result) => result.message === undefined)) {
+				if ((permission && !permissionMatch) || results.some((result) => result.message === undefined)) {
 					cancelPermission(binding);
 					cancelPiTools(binding, "Pi continued without returning every requested tool result");
 					await this.dropBinding(key, binding);
@@ -597,14 +599,44 @@ export class AntigravityRuntime {
 					binding.writer = writer;
 					this.touchBinding(binding);
 					this.noteContinuationInstructions(binding, context);
-					binding.pendingContextCount = context.messages.length;
-					binding.pendingContextFingerprint = messagesFingerprint(context.messages);
+					const delivered = new Set<Context["messages"][number]>();
+					for (const { message } of results) delivered.add(message as ToolResultMessage);
+					if (permissionMatch) delivered.add(permissionMatch.message);
+					const boundary = binding.deliveredCount;
+					const prefixValid =
+						context.messages.length >= boundary &&
+						messagesFingerprint(context.messages.slice(0, boundary)) === binding.deliveredFingerprint;
+					const undelivered: Context["messages"] = [];
+					let carrier: (typeof results)[number] | undefined;
+					if (!prefixValid) {
+						binding.needsReconstruction = true;
+					} else {
+						const seen = new Set<string>();
+						for (const message of [
+							...heldBackMessages(context, binding.deliveredHeldBack),
+							...undeliveredSince(context, boundary, delivered),
+						]) {
+							const fingerprint = messageFingerprint(message);
+							if (seen.has(fingerprint)) continue;
+							seen.add(fingerprint);
+							undelivered.push(message);
+						}
+						// ACP permission responses carry no content, so only a tool result can deliver these in-turn.
+						carrier = undelivered.length > 0
+							? results.filter(({ message }) => !message?.isError).at(-1) ?? results.at(-1)
+							: undefined;
+						binding.deliveredHeldBack = carrier ? [] : undelivered.map(messageFingerprint);
+					}
+					binding.deliveredCount = context.messages.length;
+					binding.deliveredFingerprint = messagesFingerprint(context.messages);
 					this.commitProgress(binding);
 					for (const { pending, message } of results) {
 						binding.pendingTools.delete(pending.invocation.id);
-						pending.resolve(toMcpToolResult(message as ToolResultMessage));
+						const toolResult = toMcpToolResult(message as ToolResultMessage);
+						pending.resolve(pending === carrier?.pending ? attachUndelivered(toolResult, undelivered) : toolResult);
 					}
-					if (permission && permissionResult) {
+					if (permission && permissionMatch) {
+						const permissionResult = permissionMatch.result;
 						binding.permission = undefined;
 						clearTimeout(permission.timer);
 						if (
@@ -678,8 +710,9 @@ export class AntigravityRuntime {
 				) {
 					unseenStart += 1;
 				}
+				const heldBack = fresh ? [] : heldBackMessages(context, binding.heldBack);
 				const parts = adaptPromptToCapabilities(
-					buildPromptParts(context, fresh, unseenStart),
+					buildPromptParts(context, fresh, unseenStart, heldBack),
 					binding.initialize,
 				);
 				await this.modeChanges;
@@ -694,8 +727,9 @@ export class AntigravityRuntime {
 				}
 				binding.instructionsFingerprint = instructionFingerprint(context);
 				binding.needsReconstruction = false;
-				binding.pendingContextCount = context.messages.length;
-				binding.pendingContextFingerprint = messagesFingerprint(context.messages);
+				binding.deliveredCount = context.messages.length;
+				binding.deliveredFingerprint = messagesFingerprint(context.messages);
+				binding.deliveredHeldBack = [];
 				binding.contextUsed = undefined;
 				binding.inferences = 0;
 				binding.turnCompletion = new Promise<void>((resolve) => {
@@ -742,9 +776,10 @@ export class AntigravityRuntime {
 					};
 				} else activeWriter.message.usage = usage;
 				activeWriter.message.rawStopReason = response.stopReason;
-				binding.messageCount = binding.pendingContextCount || parts.messageCount;
-				binding.historyFingerprint = binding.pendingContextFingerprint;
+				binding.messageCount = binding.deliveredCount || parts.messageCount;
+				binding.historyFingerprint = binding.deliveredFingerprint;
 				binding.expectedAssistantFingerprint = messageFingerprint(activeWriter.message);
+				binding.heldBack = binding.deliveredHeldBack;
 				this.persistBinding(binding);
 				switch (response.stopReason) {
 					case "cancelled":
@@ -952,8 +987,10 @@ export class AntigravityRuntime {
 				messageCount: restored && saved ? saved.messageCount : 0,
 				historyFingerprint: restored && saved ? saved.historyFingerprint : messagesFingerprint([]),
 				expectedAssistantFingerprint: restored ? saved?.expectedAssistantFingerprint : undefined,
-				pendingContextCount: 0,
-				pendingContextFingerprint: messagesFingerprint([]),
+				heldBack: restored && saved ? saved.heldBack ?? [] : [],
+				deliveredCount: 0,
+				deliveredFingerprint: messagesFingerprint([]),
+				deliveredHeldBack: [],
 				writer,
 				permission: undefined,
 				pendingTools: new Map(),
@@ -991,10 +1028,11 @@ export class AntigravityRuntime {
 	}
 
 	private commitProgress(binding: Binding, assistantMessage?: Context["messages"][number]): void {
-		if (binding.pendingContextCount <= 0) return;
-		binding.messageCount = binding.pendingContextCount;
-		binding.historyFingerprint = binding.pendingContextFingerprint;
+		if (binding.deliveredCount <= 0) return;
+		binding.messageCount = binding.deliveredCount;
+		binding.historyFingerprint = binding.deliveredFingerprint;
 		binding.expectedAssistantFingerprint = assistantMessage ? messageFingerprint(assistantMessage) : undefined;
+		binding.heldBack = binding.deliveredHeldBack;
 		this.persistBinding(binding);
 	}
 
@@ -1011,6 +1049,7 @@ export class AntigravityRuntime {
 			...(binding.expectedAssistantFingerprint
 				? { expectedAssistantFingerprint: binding.expectedAssistantFingerprint }
 				: {}),
+			...(binding.heldBack.length > 0 ? { heldBack: binding.heldBack } : {}),
 			lastActive: Date.now(),
 		});
 	}
@@ -1308,7 +1347,10 @@ function permissionView(permission: PendingPermission): PermissionView {
 	};
 }
 
-function findPermissionResult(context: Context, requestId: string): PermissionToolResult | undefined {
+function findPermissionResult(
+	context: Context,
+	requestId: string,
+): { message: ToolResultMessage; result: PermissionToolResult } | undefined {
 	for (let index = context.messages.length - 1; index >= 0; index--) {
 		const message = context.messages[index];
 		if (
@@ -1324,14 +1366,17 @@ function findPermissionResult(context: Context, requestId: string): PermissionTo
 			details.requestId === requestId &&
 			typeof details.cancelled === "boolean"
 		) {
-			return details as PermissionToolResult;
+			return { message, result: details as PermissionToolResult };
 		}
 		// A missing/disabled tool or malformed output is an immediate denial,
 		// never an implicit approval and never a hung ACP request.
 		return {
-			kind: PERMISSION_RESULT_KIND,
-			requestId,
-			cancelled: true,
+			message,
+			result: {
+				kind: PERMISSION_RESULT_KIND,
+				requestId,
+				cancelled: true,
+			},
 		};
 	}
 	return undefined;
@@ -1412,6 +1457,54 @@ function toMcpToolResult(message: ToolResultMessage): CallToolResult {
 		),
 		isError: message.isError,
 	};
+}
+
+function heldBackMessages(context: Context, fingerprints: readonly string[]): Context["messages"] {
+	if (fingerprints.length === 0) return [];
+	const wanted = new Set(fingerprints);
+	const matched: Context["messages"] = [];
+	for (let index = context.messages.length - 1; index >= 0; index--) {
+		const message = context.messages[index];
+		if (!message || message.role === "system" || message.role === "assistant") continue;
+		const fingerprint = messageFingerprint(message);
+		if (!wanted.has(fingerprint)) continue;
+		wanted.delete(fingerprint);
+		matched.unshift(message);
+	}
+	return matched;
+}
+
+function undeliveredSince(
+	context: Context,
+	boundary: number,
+	delivered: Set<Context["messages"][number]>,
+): Context["messages"] {
+	return context.messages
+		.slice(boundary)
+		.filter((message) => message.role !== "system" && message.role !== "assistant" && !delivered.has(message));
+}
+
+function attachUndelivered(result: CallToolResult, messages: Context["messages"]): CallToolResult {
+	const content: CallToolResult["content"] = [
+		...result.content,
+		{
+			type: "text",
+			text: `[Pi delivered ${messages.length} message(s) while this tool ran. They are not tool output.]`,
+		},
+	];
+	for (const message of messages) {
+		const rendered = renderHistoryMessage(message, "attached");
+		if (rendered) content.push({ type: "text", text: rendered });
+		if ((message.role !== "user" && message.role !== "toolResult") || !Array.isArray(message.content)) {
+			continue;
+		}
+		for (const block of message.content) {
+			if (block.type === "image") {
+				content.push({ type: "image", data: block.data, mimeType: block.mimeType });
+			}
+		}
+	}
+	return { ...result, content };
 }
 
 function cancelPermission(binding: Binding): void {

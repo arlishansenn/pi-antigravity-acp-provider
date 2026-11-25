@@ -11,6 +11,7 @@ export interface SavedSessionRecord {
 	messageCount: number;
 	historyFingerprint: string;
 	expectedAssistantFingerprint?: string;
+	heldBack?: string[];
 	lastActive: number;
 }
 
@@ -82,6 +83,8 @@ function validRecord(value: unknown): value is SavedSessionRecord {
 		typeof record.historyFingerprint === "string" &&
 		(record.expectedAssistantFingerprint === undefined ||
 			typeof record.expectedAssistantFingerprint === "string") &&
+		(record.heldBack === undefined ||
+			(Array.isArray(record.heldBack) && record.heldBack.every((item) => typeof item === "string"))) &&
 		typeof record.lastActive === "number" &&
 		Number.isFinite(record.lastActive)
 	);

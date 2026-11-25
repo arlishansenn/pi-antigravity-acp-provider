@@ -167,6 +167,53 @@ describe("bounded context reconstruction", () => {
 		expect(buildPromptParts(context, true).prompt.at(-1)).toEqual({ type: "text", text: "REQUEST" });
 		expect(buildPromptParts(context, false, 0).prompt).toEqual([{ type: "text", text: "REQUEST" }]);
 	});
+
+	it("delivers held-back messages whole beside an over-budget delta", () => {
+		const big = (tag: string, size: number) => `${tag}_HEAD ${"x".repeat(size)} ${tag}_TAIL`;
+		const steer: Context["messages"][number] = { role: "user", content: big("HELD", 6_000), timestamp: 1 };
+		const older = Array.from({ length: 20 }, (_, index): Context["messages"][number] => ({ role: "user", content: big(`OLD${index}`, 1_000), timestamp: 2 + index }));
+		const context: Context = { messages: [
+			steer, ...older,
+			{ role: "user", content: "ACTIVE_REQUEST", timestamp: 50 },
+			assistant([{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.ts" } }]),
+			result(big("RESULT", 25_000)),
+		] };
+		const { prompt } = buildPromptParts(context, false, 1, [steer]);
+		const held = resourceText(prompt[0]);
+		expect(held).toContain("# Pi messages received during the previous Antigravity turn");
+		expect(held).toContain("HELD_HEAD");
+		expect(held).toContain("HELD_TAIL");
+		const delta = resourceText(prompt[1]);
+		expect(delta.length).toBeLessThanOrEqual(LIMIT);
+		expect(delta).toContain("RESULT_TAIL");
+	});
+
+	it("does not send a held-back copy of the request twice", () => {
+		const context: Context = { messages: [
+			{ role: "user", content: "FIRST", timestamp: 1 },
+			assistant([{ type: "toolCall", id: "call-1", name: "read", arguments: {} }]),
+			result("done"),
+			{ role: "user", content: "HELD_BACK_REQUEST", timestamp: 4 },
+		] };
+		const { prompt } = buildPromptParts(context, false, context.messages.length, [context.messages[3]!]);
+		expect(prompt).toEqual([{ type: "text", text: "HELD_BACK_REQUEST" }]);
+	});
+
+	it("marks held-back images as attached and separates the delta from the held-back section", () => {
+		const steer: Context["messages"][number] = { role: "user", content: [{ type: "text", text: "HELD_WITH_IMAGE" }, IMAGE], timestamp: 1 };
+		const context: Context = { messages: [
+			{ role: "user", content: "OLDER", timestamp: 0 },
+			steer,
+			{ role: "user", content: "ACTIVE_REQUEST", timestamp: 2 },
+			assistant([{ type: "toolCall", id: "call-1", name: "read", arguments: {} }]),
+			result("NEW_RESULT"),
+		] };
+		const { prompt } = buildPromptParts(context, false, 2, [steer]);
+		expect(resourceText(prompt[0])).toContain("[image attached below]");
+		expect(prompt[1]).toEqual(IMAGE);
+		expect(resourceText(prompt[2]).startsWith("\n\n---\n\n# Context added outside the warm Antigravity session")).toBe(true);
+		expect(resourceText(prompt[2])).not.toContain("[image omitted]");
+	});
 });
 
 describe("slash command neutralization", () => {
