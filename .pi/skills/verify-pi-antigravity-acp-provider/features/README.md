@@ -9,6 +9,7 @@ This directory is the maintained source for verifying the user-facing behavior o
 | [Mid-turn steer](mid-turn-steer.md) | a steer message arriving with a tool result | driven by `verify.sh steer-tool` |
 | [Permission broker](permission-broker.md) | `antigravity_acp_permission` tool call | protocol-level only (`test/steer-continuation.test.ts`) |
 | [Session restore](session-restore.md) | `pi --continue` after a restart | protocol-level only (`test/session-store*.test.ts`) |
+| [Upstream failures](upstream-failures.md) | a backend, network, or sign-in failure | driven by `fault-run.sh` |
 
 ## Baseline preconditions
 
