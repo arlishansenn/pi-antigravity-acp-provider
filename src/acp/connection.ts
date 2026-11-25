@@ -16,6 +16,7 @@ import {
 
 import { PACKAGE_VERSION } from "../constants.js";
 import { boundedNdjsonStream } from "./bounded-stream.js";
+import { classifyFailure } from "./failure-classes.js";
 import {
 	abortError,
 	AntigravityAcpError,
@@ -477,6 +478,13 @@ export class AntigravityAcpConnection {
 				this.processFailure,
 				new Promise<never>((_resolve, reject) => {
 					timer = setTimeout(() => {
+						const failure = classifyFailure(this.process.stderrTail);
+						if (failure?.id === "login-required") {
+							void this.close();
+							reject(new AntigravityAcpError("auth",
+								`Antigravity sign-in required: the runtime opened a Google sign-in page during ${phase} instead of answering. ${failure.hint}`));
+							return;
+						}
 						const header = `Antigravity ACP ${phase} timed out after ${timeoutMs}ms`;
 						const detail = formatFailureStderr(this.process.stderrTail, this.diagnostics.parts, header);
 						void this.close();
